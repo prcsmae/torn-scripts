@@ -409,7 +409,11 @@ function itemNextRestockMs(s, entry, nowMs) {
     return qty;
   }
   // Is an item buyable the moment you land (arrivalMs)?
-  // status: 'instock' | 'restock' (returns before/at landing) | 'empty'.
+  // status: 'instock' | 'restock' (returns before/at landing, or within
+  // POST_ARRIVAL_MINS after) | 'empty'.  Restocked items are checked against
+  // the buffered sell rate: if the fresh stock sells out again before you
+  // land the item is marked empty.
+  var POST_ARRIVAL_MINS = 5; // min you're willing to wait on the ground
   function landingAvailability(s, entry, nowMs, arrivalMs, stockWindowMin) {
     const qty = typeof s.quantity === "number" ? s.quantity : 0;
     if (qty > 0) {
@@ -422,14 +426,53 @@ function itemNextRestockMs(s, entry, nowMs) {
         if (state.respectStock) {
           const nrMs = itemNextRestockMs(s, entry, nowMs);
           if (nrMs != null && nrMs <= arrivalMs) {
+            const survived = restockSurvival(
+              modelRestockQty(entry) || qty,
+              entry && entry.sellRate,
+              arrivalMs,
+              nrMs,
+            );
+            if (survived > 0) {
+              return {
+                status: "restock",
+                qty: survived,
+                note: "sells out, restocks before you land",
+                restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
+                beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+                conf,
+              };
+            }
             return {
-              status: "restock",
-              qty: modelRestockQty(entry) || qty,
-              note: "sells out, restocks before you land",
-              restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
-              beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+              status: "empty",
+              qty: 0,
+              note:
+                "restocks " +
+                Math.max(1, Math.round((arrivalMs - nrMs) / 60000)) +
+                "m before you land but sells out again",
               conf,
             };
+          }
+          // Restock after landing but within the wait window?
+          if (nrMs != null && nrMs <= arrivalMs + POST_ARRIVAL_MINS * 60000) {
+            const survived = restockSurvival(
+              modelRestockQty(entry) || qty,
+              entry && entry.sellRate,
+              arrivalMs + POST_ARRIVAL_MINS * 60000,
+              nrMs,
+            );
+            if (survived > 0) {
+              return {
+                status: "restock",
+                qty: survived,
+                note:
+                  "restocks ~" +
+                  Math.max(1, Math.round((nrMs - arrivalMs) / 60000)) +
+                  "m after you land — wait",
+                restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
+                beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+                conf,
+              };
+            }
           }
           return {
             status: "empty",
@@ -465,14 +508,53 @@ function itemNextRestockMs(s, entry, nowMs) {
     const nrMs = itemNextRestockMs(s, entry, nowMs);
     const byMs = arrivalMs + (stockWindowMin || 0) * 60000 - RESTOCK_CUSHION_MIN * 60000;
     if (nrMs != null && nrMs <= byMs) {
+      const survived = restockSurvival(
+        modelRestockQty(entry) || state.capacity * 3,
+        entry && entry.sellRate,
+        arrivalMs,
+        nrMs,
+      );
+      if (survived > 0) {
+        return {
+          status: "restock",
+          qty: survived,
+          note: "restocks before you land",
+          restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
+          beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+          conf,
+        };
+      }
       return {
-        status: "restock",
-        qty: modelRestockQty(entry) || state.capacity * 3,
-        note: "restocks before you land",
-        restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
-        beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+        status: "empty",
+        qty: 0,
+        note:
+          "restocks " +
+          Math.max(1, Math.round((arrivalMs - nrMs) / 60000)) +
+          "m before you land but sells out again",
         conf,
       };
+    }
+    // Restock within the post-arrival wait window?
+    if (nrMs != null && nrMs <= arrivalMs + POST_ARRIVAL_MINS * 60000) {
+      const survived = restockSurvival(
+        modelRestockQty(entry) || state.capacity * 3,
+        entry && entry.sellRate,
+        arrivalMs + POST_ARRIVAL_MINS * 60000,
+        nrMs,
+      );
+      if (survived > 0) {
+        return {
+          status: "restock",
+          qty: survived,
+          note:
+            "restocks ~" +
+            Math.max(1, Math.round((nrMs - arrivalMs) / 60000)) +
+            "m after you land — wait",
+          restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
+          beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+          conf,
+        };
+      }
     }
     return { status: "empty", qty: 0, note: "empty at landing", conf };
   }
@@ -844,6 +926,10 @@ function itemNextRestockMs(s, entry, nowMs) {
       const before = ld.beforeLanding != null ? ld.beforeLanding : "?";
       const inMin = ld.restockIn != null ? ld.restockIn : "?";
       const conf = ld.conf ? ld.conf.label : "";
+      // Post-arrival restock: beforeLanding is negative; use the note instead.
+      if (typeof before === "number" && before < 0) {
+        return `<span style="color:#c9a227;font-size:10px;" title="Restocks in ~${inMin}m from now (~${-before}m after you land) — confidence: ${conf}">🟡 ${ld.note || "restocks shortly after you land"}${conf ? " · " + conf : ""}</span>`;
+      }
       return `<span style="color:#c9a227;font-size:10px;" title="Restocks in ~${inMin}m from now (~${before}m before you land) — confidence: ${conf}">🟡 restocks ~${before}m before you land${conf ? " · " + conf : ""}</span>`;
     }
     if (ld.status === "instock" && ld.depletion) {
@@ -854,6 +940,9 @@ function itemNextRestockMs(s, entry, nowMs) {
     }
     if (ld.status === "instock")
       return '<span style="color:#28a745;font-size:10px;">🟢 in stock</span>';
+    // empty with a useful note
+    if (ld.note && ld.note !== "empty at landing")
+      return `<span style="color:#d8736a;font-size:10px;" title="${ld.note}">🔴 ${ld.note}</span>`;
     return '<span style="color:#dc3545;font-size:10px;">🔴 empty</span>';
   }
 
