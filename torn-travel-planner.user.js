@@ -10,6 +10,8 @@
 // @grant        GM_xmlhttpRequest
 // @connect      api.torn.com
 // @connect      yata.yt
+// @connect      api.prombot.co.uk
+// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 (function () {
@@ -18,7 +20,9 @@
   // ========== CONFIG ==========
   const CONFIG = {
     apiKey: "A0SxQ5FFORk9CNAs", // Minimal access is enough (items only)
-    yataUrl: "https://yata.yt/api/v1/travel/export/", // public, no auth
+    yataUrl: "https://yata.yt/api/v1/travel/export/", // public, no auth (no restock field)
+    prombotUrl: "https://api.prombot.co.uk/api/travel", // public; provides nextRestock (ISO)
+    modelUrl: "https://raw.githubusercontent.com/russianrob/torn-foreign-restock/main/restock-model.json", // restock intervals/qtys
     cacheDuration: 300000, // 5 min cache
     autoRefreshMs: 600000, // 10 min auto-refresh
     defaultNetPct: 97, // what you actually get from trading (95-97)
@@ -108,6 +112,11 @@
     netPct: CONFIG.defaultNetPct,
     budget: CONFIG.defaultBudget,
     bufferMin: CONFIG.defaultBufferMin,
+    respectStock: true, // only buy items that will be in stock when you land
+    stockWindow: -1, // aim to land ~N min AFTER a restock (default -1 per playbook)
+    nerveWasteLimit: 0, // max nerve you'll allow to cap while airborne before warning (0 = none)
+    apiKey: "", // user's own API key ('' = disabled); enables nerve/restock reads
+    restockConfidence: "med", // only trust OOS-restock predictions at/above this ('high'|'med'|'low')
     activeStart: "", // HH:MM ('' = disabled)
     activeEnd: "", // HH:MM ('' = disabled)
     sleepHours: CONFIG.defaultSleepHours,
@@ -128,6 +137,14 @@
           ? state.bufferMin
           : CONFIG.defaultBufferMin;
         state.sleepHours = Number(state.sleepHours) || CONFIG.defaultSleepHours;
+        if (state.respectStock == null) state.respectStock = true;
+        state.stockWindow = Number.isFinite(state.stockWindow)
+          ? state.stockWindow
+          : -1;
+        state.nerveWasteLimit = Number.isFinite(state.nerveWasteLimit)
+          ? state.nerveWasteLimit
+          : 0;
+        if (!state.restockConfidence) state.restockConfidence = "med";
       }
       // Default the active-window start to "now" if nothing is saved.
       // (Only fills start; leave end empty so the window isn't accidentally enabled.)
@@ -189,18 +206,76 @@
   }
 
   async function fetchAbroad(force) {
+    // PromBot provides nextRestock (ISO) per item; YATA is the fallback (no restock field).
+    const urls = [CONFIG.prombotUrl, CONFIG.yataUrl];
+    let lastErr = null;
+    for (const url of urls) {
+      if (!force) {
+        const cached = getCached(url);
+        if (cached) return cached;
+      }
+      try {
+        const data = await gmFetch(url);
+        if (!data || !data.stocks) throw new Error("travel: unexpected response");
+        apiCache[url] = { data: data, ts: Date.now() };
+        return data;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("travel: no data source");
+  }
+
+  async function fetchModel(force) {
+    const url = CONFIG.modelUrl;
     if (!force) {
-      const cached = getCached(CONFIG.yataUrl);
+      const cached = getCached(url);
+      if (cached) return cached.items;
+    }
+    const data = await gmFetch(url);
+    if (!data || !data.items) throw new Error("model: unexpected response");
+    apiCache[url] = { data: data, ts: Date.now() };
+    return data.items || {};
+  }
+
+  // Non-fatal wrapper: if the restock model can't load, planning still works.
+  async function fetchModelSafe(force) {
+    try {
+      return (await fetchModel(force)) || {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  // Current nerve from the user's own API key ('' = disabled).
+  async function fetchNerve(force) {
+    const key = state.apiKey;
+    if (!key) return null;
+    const url = "https://api.torn.com/user/?selections=basic&key=" + encodeURIComponent(key);
+    if (!force) {
+      const cached = getCached(url);
       if (cached) return cached;
     }
-    const data = await gmFetch(CONFIG.yataUrl);
-    if (!data || !data.stocks) throw new Error("YATA: unexpected response");
-    apiCache[CONFIG.yataUrl] = { data: data, ts: Date.now() };
+    const data = await gmFetch(url);
+    if (!data || data.error || data.nerve == null) return null;
+    apiCache[url] = { data: data, ts: Date.now() };
     return data;
   }
 
+  // Non-fatal: a missing/invalid API key must not break price/stock planning.
+  async function fetchNerveSafe(force) {
+    try {
+      return (await fetchNerve(force)) || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   async function fetchItems(force) {
-    const url = "https://api.torn.com/torn/?selections=items&key=" + CONFIG.apiKey;
+    // Prefer the user's own API key (per-user rate limit); fall back to the
+    // shared CONFIG key (minimal access is enough for items) if none is set.
+    const key = state.apiKey || CONFIG.apiKey;
+    const url = "https://api.torn.com/torn/?selections=items&key=" + key;
     if (!force) {
       const cached = getCached(url);
       if (cached) return cached;
@@ -244,16 +319,198 @@
     return d;
   }
 
+  // ========== RESTOCK + NERVE HELPERS ==========
+  // YATA/PromBot may give nextRestock as seconds, milliseconds, or an ISO string.
+  function toMs(v) {
+    if (v == null || v === "") return null;
+    if (typeof v === "number") return v < 100000000000 ? v * 1000 : v;
+    const t = Date.parse(String(v));
+    return isNaN(t) ? null : t;
+  }
+  // Next restock time (ms): PromBot's nextRestock first, else estimate from the
+// restock model (last restock + next multiple of the interval).
+// A nextRestock already in the PAST means the export is stale (the shop hasn't
+// actually refilled yet) — ignore it rather than claim it'll be in stock.
+function itemNextRestockMs(s, entry, nowMs) {
+    if (s && s.nextRestock != null) {
+      const m = toMs(s.nextRestock);
+      if (m != null && m > nowMs) return m; // only future restocks are actionable
+    }
+    if (entry && typeof entry.last === "number" && typeof entry.interval === "number") {
+      const last = entry.last * 1000;
+      const interval = entry.interval * 1000;
+      if (last > nowMs) return last;
+      const n = Math.ceil((nowMs - last) / interval);
+      return last + n * interval;
+    }
+    return null;
+  }
+  function modelRestockQty(entry) {
+    if (entry && Array.isArray(entry.qs) && entry.qs.length) {
+      const a = [...entry.qs].sort((x, y) => x - y);
+      const m = Math.floor(a.length / 2);
+      const med = a.length % 2 ? a[m] : Math.round((a[m - 1] + a[m]) / 2);
+      if (med > 0) return med;
+    }
+    if (typeof (entry && entry.modelQty) === "number" && entry.modelQty > 0)
+      return entry.modelQty;
+    return null;
+  }
+  function confRank(c) {
+    return c === "high" ? 3 : c === "med" ? 2 : 1;
+  }
+  // Confidence in a restock estimate, mirroring foreign-stock's reliability (rel):
+  // live PromBot nextRestock = high; model rel high = high, med = medium; else low.
+  // A small sample count (n) degrades the estimate.
+  function restockConfidence(s, entry) {
+    let level = "low";
+    if (s && s.nextRestock != null) level = "high";
+    else if (entry && entry.rel === "high") level = "high";
+    else if (entry && entry.rel === "med") level = "med";
+    const n = entry && typeof entry.n === "number" ? entry.n : 0;
+    if (n > 0 && n < 8) {
+      if (level === "med") level = "low";
+      else if (level === "high" && !(s && s.nextRestock != null)) level = "med";
+    }
+    return { level, label: level === "high" ? "high" : level === "med" ? "medium" : "low" };
+  }
+  const RESTOCK_CUSHION_MIN = 3; // minutes of safety on top of stockWindow, so a bumpy restock estimate still shelves before you land
+  // Predicted minutes until an in-stock item sells out, from the model's sellRate
+  // (mirrors foreign-stock: buffered so we err toward 'sells out sooner').
+  const SELL_SAFETY = 1.15;
+  function depletionInfo(qty, entry) {
+    if (
+      qty > 0 &&
+      entry &&
+      typeof entry.sellRate === "number" &&
+      isFinite(entry.sellRate)
+    ) {
+      const rate = entry.sellRate * SELL_SAFETY;
+      if (rate > 0) return { depletesMin: qty / rate };
+    }
+    return null;
+  }
+  // How much of a FUTURE restock (at restockMs) is still on the shelf when you
+  // land (arrivalMs), given the model's buffered sell rate. Returns qty when no
+  // sell rate is known (assume the full restock survives).
+  function restockSurvival(qty, sellRate, arrivalMs, restockMs) {
+    if (!(qty > 0)) return 0;
+    if (
+      typeof sellRate === "number" &&
+      isFinite(sellRate) &&
+      sellRate > 0 &&
+      restockMs != null &&
+      arrivalMs > restockMs
+    ) {
+      const minsAfter = (arrivalMs - restockMs) / 60000;
+      const left = Math.floor(qty - sellRate * SELL_SAFETY * minsAfter);
+      return Math.max(0, left);
+    }
+    return qty;
+  }
+  // Is an item buyable the moment you land (arrivalMs)?
+  // status: 'instock' | 'restock' (returns before/at landing) | 'empty'.
+  function landingAvailability(s, entry, nowMs, arrivalMs, stockWindowMin) {
+    const qty = typeof s.quantity === "number" ? s.quantity : 0;
+    if (qty > 0) {
+      const conf = { level: "high", label: "high" };
+      const dep = depletionInfo(qty, entry);
+      const flightMin = (arrivalMs - nowMs) / 60000;
+      const beforeLand = dep ? dep.depletesMin - flightMin : null; // + = after landing, - = before
+      if (beforeLand != null && beforeLand < 0) {
+        // In stock now, but likely sold out before you land.
+        if (state.respectStock) {
+          const nrMs = itemNextRestockMs(s, entry, nowMs);
+          if (nrMs != null && nrMs <= arrivalMs) {
+            return {
+              status: "restock",
+              qty: modelRestockQty(entry) || qty,
+              note: "sells out, restocks before you land",
+              restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
+              beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+              conf,
+            };
+          }
+          return {
+            status: "empty",
+            qty: 0,
+            note: "depletes ~" + Math.max(1, Math.round(-beforeLand)) + "m before you land",
+            conf,
+          };
+        }
+        return {
+          status: "instock",
+          qty,
+          note: "in stock",
+          conf,
+          depletion: { sellsOutBeforeLand: true, beforeLanding: Math.max(1, Math.round(-beforeLand)) },
+        };
+      }
+      return {
+        status: "instock",
+        qty,
+        note: "in stock",
+        conf,
+        depletion: {
+          depletesMin: dep ? Math.round(dep.depletesMin) : null,
+          beforeLanding: beforeLand != null ? Math.max(1, Math.round(beforeLand)) : null,
+        },
+      };
+    }
+    // Out of stock: confidence gate + restock-vs-landing.
+    const conf = restockConfidence(s, entry);
+    if (confRank(state.restockConfidence || "med") > confRank(conf.level)) {
+      return { status: "empty", qty: 0, note: "restock too uncertain", conf };
+    }
+    const nrMs = itemNextRestockMs(s, entry, nowMs);
+    const byMs = arrivalMs + (stockWindowMin || 0) * 60000 - RESTOCK_CUSHION_MIN * 60000;
+    if (nrMs != null && nrMs <= byMs) {
+      return {
+        status: "restock",
+        qty: modelRestockQty(entry) || state.capacity * 3,
+        note: "restocks before you land",
+        restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
+        beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+        conf,
+      };
+    }
+    return { status: "empty", qty: 0, note: "empty at landing", conf };
+  }
+  // Nerve-waste estimate for a round trip of `roundTripMin` minutes.
+  function nerveInfo(roundTripMin, nerve) {
+    const max = (nerve && nerve.nerve_maximum) || 100;
+    const nowPts = nerve && typeof nerve.nerve === "number" ? nerve.nerve : null;
+    const base = { max, now: nowPts, msPerNerve: null, regen: 0, waste: 0, spendTo: null };
+    if (nerve == null || nowPts == null) return base;
+    let msPerNerve = null;
+    if (nowPts < max && nerve.nerve_fulltime) {
+      const fullMs = nerve.nerve_fulltime * 1000;
+      if (fullMs > Date.now()) msPerNerve = (fullMs - Date.now()) / (max - nowPts);
+    }
+    if (msPerNerve == null || !isFinite(msPerNerve) || msPerNerve <= 0)
+      msPerNerve = 5 * 60000; // default: 1 nerve / 5 min
+    const regen = Math.floor((roundTripMin * 60000) / msPerNerve);
+    const waste = Math.max(0, regen - (max - nowPts));
+    return {
+      max,
+      now: nowPts,
+      msPerNerve,
+      regen,
+      waste,
+      spendTo: Math.max(0, Math.round(nowPts - waste)),
+    };
+  }
+
   // ========== CORE COMPUTATION ==========
   // Build one row per destination with trip profit (budget-allocated buy-list),
-  // PPH, active-window profit, suggested top items, and sleep (one-way) info.
-  function computeDestinations(abroad, items) {
+  // PPH, active-window profit, suggested top items, restock/nerve awareness.
+  function computeDestinations(abroad, items, models, nerve) {
     const mode = state.mode;
     const cap = state.capacity;
     const netPct = state.netPct / 100;
     const buffer = state.bufferMin; // buy-time buffer (all flights)
     const windowMin = windowMinutes();
-    const net = {}; // destKey -> summary
+    const nowMs = Date.now();
     const rows = [];
 
     for (const key of Object.keys(CONFIG.destinations)) {
@@ -262,7 +519,8 @@
       const travelCost = mode === "standard" ? dc.cost : 0; // only standard pays
       const stock = (abroad.stocks && abroad.stocks[key] && abroad.stocks[key].stocks) || [];
 
-      // --- Candidate items with real net profit ---
+      // --- Candidate items with real net profit, buying only what is in stock on arrival ---
+      const arrivalMs = nowMs + oneWay * 60000;
       const cands = [];
       for (const s of stock) {
         const it = items[s.id];
@@ -273,26 +531,40 @@
         const received = mv * netPct;
         const unitNet = received - s.cost;
         if (unitNet <= 0) continue;
+        const entry = models && models[key] ? models[key][s.id] : null;
+        let stockQty = typeof s.quantity === "number" ? s.quantity : 0;
+        let landing = null;
+        if (state.respectStock) {
+          landing = landingAvailability(s, entry, nowMs, arrivalMs, state.stockWindow);
+          if (landing.status === "empty") continue; // won't be buyable when you land
+          stockQty = landing.qty;
+        }
         cands.push({
           id: s.id,
           name: it.name || "#" + s.id,
-          stockQty: s.quantity,
+          stockQty,
           cost: s.cost,
           received,
           unitNet,
+          landing,
         });
       }
       cands.sort((a, b) => b.unitNet - a.unitNet);
 
-      // --- Budget allocation (greedy by unit net) ---
+      // --- Budget allocation (greedy by unit net), capped by flight capacity ---
       let remaining = state.budget;
       const buyList = [];
+      let slotsUsed = 0;
       for (const c of cands) {
         if (remaining < 1) break;
+        const bySlots = cap - slotsUsed;
         const perCap = Math.min(c.stockQty, cap);
         const byBudget = Math.floor(remaining / c.cost);
-        const qty = Math.min(perCap, byBudget);
-        if (qty <= 0) continue;
+        const qty = Math.min(perCap, byBudget, bySlots);
+        if (qty <= 0) {
+          if (cap > 0 && slotsUsed >= cap) break; // flight capacity full
+          continue;
+        }
         buyList.push({
           name: c.name,
           qty,
@@ -300,8 +572,10 @@
           unitNet: c.unitNet,
           profit: c.unitNet * qty,
           spent: c.cost * qty,
+          landing: c.landing,
         });
         remaining -= c.cost * qty;
+        slotsUsed += qty;
       }
 
       let tripProfit = 0,
@@ -322,6 +596,7 @@
       const windowProfit = trips * tripProfitNet;
 
       const top = buyList.slice(0, 3);
+      const nrv = nerveInfo(roundTripMin, nerve);
 
       rows.push({
         key,
@@ -338,6 +613,9 @@
         tripProfit,
         tripProfitNet,
         budgetSpent,
+        roi: budgetSpent > 0 ? (tripProfit / budgetSpent) * 100 : 0,
+        slots: slotsUsed,
+        nerve: nrv,
         top,
         buyList,
       });
@@ -346,33 +624,193 @@
     // Sort for table default: recommended (PPH high, or window profit when window active)
     const sortKey = windowMin != null ? "windowProfit" : "pph";
     rows.sort((a, b) => b[sortKey] - a[sortKey]);
-    return { rows, windowMin, sortKey };
+    return { rows, windowMin, sortKey, nerve };
   }
 
-  // Sleep recommendation: long-haul only, ONE-WAY time. You are asleep, so you only
-  // fly OUT. We prefer the longest one-way flight that fits within your sleep so you
-  // set an alarm and wake as you land. Buffer is noted separately (you buy items awake).
-  function sleepRecommendation(rows) {
+  // Sleep plan: for each destination, find the most profitable item that will be
+  // in stock when you land, and tell you when to depart so the fresh restock is
+  // still on the shelf. Two scenarios per destination:
+  //   timed — depart at restock+window−flight, land right after the restock
+  //   now   — depart immediately, item must survive (or restock) until landing
+  // Both allocate your budget + capacity like the main planner; destinations are
+  // ranked by net trip profit (travel cost subtracted).
+  function computeSleepPlan(abroad, items, models) {
+    const mode = state.mode;
+    const cap = state.capacity;
+    const netPct = state.netPct / 100;
     const sleepMin = state.sleepHours * 60;
-    const list = rows
-      .map((r) => ({
-        key: r.key,
-        name: r.name,
-        city: r.city,
-        oneWay: r.oneWay,
-        buffer: state.bufferMin,
-        tripProfit: r.tripProfit,
-        top: r.top,
-      }))
-      .sort((a, b) => b.oneWay - a.oneWay); // long-haul first
-    // Longest one-way that still fits the sleep window (you wake right as you land)
-    const fitting = list.filter((r) => r.oneWay <= sleepMin);
-    const chosen = fitting.length ? fitting[0] : list[0];
-    return {
-      list,
-      chosen,
-      fitsInSleep: fitting.length ? true : list.length && chosen.oneWay <= sleepMin,
-    };
+    const nowMs = Date.now();
+    const rows = [];
+
+    for (const key of Object.keys(CONFIG.destinations)) {
+      const dc = CONFIG.destinations[key];
+      const oneWay = dc.time[mode] != null ? dc.time[mode] : dc.time.standard;
+      const travelCost = mode === "standard" ? dc.cost : 0;
+      const stock = (abroad.stocks && abroad.stocks[key] && abroad.stocks[key].stocks) || [];
+      const timedCands = [];
+      const nowCands = [];
+
+      for (const s of stock) {
+        const it = items[s.id];
+        if (!it) continue;
+        if (it.tradeable === false) continue;
+        const mv = parseFloat(it.market_value);
+        if (!(mv > 0)) continue;
+        const received = mv * netPct;
+        const unitNet = received - s.cost;
+        if (unitNet <= 0) continue;
+        const entry = models && models[key] ? models[key][s.id] : null;
+        const qtyNow = typeof s.quantity === "number" ? s.quantity : 0;
+        const R = itemNextRestockMs(s, entry, nowMs);
+        const rate =
+          entry && typeof entry.sellRate === "number" && isFinite(entry.sellRate)
+            ? entry.sellRate
+            : null;
+
+        // --- Scenario "now": land at now + flight ---
+        const arrivalNow = nowMs + oneWay * 60000;
+        const ld = landingAvailability(s, entry, nowMs, arrivalNow, state.stockWindow);
+        let availNow = 0;
+        let noteNow = "";
+        if (ld.status === "instock") {
+          availNow = ld.qty;
+          noteNow =
+            ld.depletion && ld.depletion.sellsOutBeforeLand
+              ? "sells out before you land"
+              : "in stock at landing";
+        } else if (ld.status === "restock") {
+          const q = restockSurvival(ld.qty, rate, arrivalNow, R);
+          if (q > 0) {
+            availNow = q;
+            noteNow =
+              ld.beforeLanding != null
+                ? "restocks ~" + ld.beforeLanding + "m before you land"
+                : "restocked before you land";
+          }
+        }
+        if (availNow > 0)
+          nowCands.push({ id: s.id, name: it.name || "#" + s.id, avail: availNow, cost: s.cost, received, unitNet, note: noteNow });
+
+        // --- Scenario "timed": land ~R + window + cushion after the restock ---
+        if (R) {
+          const restockInMin = (R - nowMs) / 60000;
+          const landDelayMin = restockInMin + RESTOCK_CUSHION_MIN - (state.stockWindow || 0);
+          const departureMin = landDelayMin - oneWay;
+          if (departureMin >= 0) {
+            const arrivalMin = departureMin + oneWay;
+            const qtyAtRestock = modelRestockQty(entry) || qtyNow || cap * 3;
+            const q = restockSurvival(qtyAtRestock, rate, nowMs + arrivalMin * 60000, R);
+            if (q > 0)
+              timedCands.push({
+                id: s.id,
+                name: it.name || "#" + s.id,
+                avail: q,
+                cost: s.cost,
+                received,
+                unitNet,
+                departureMin: Math.round(departureMin),
+                arrivalMin: Math.round(arrivalMin),
+                afterRestockMin: Math.max(1, Math.round(arrivalMin - restockInMin)),
+                conf: restockConfidence(s, entry),
+                note: "",
+              });
+          }
+        }
+      }
+
+      // --- Build per-scenario buy-lists (greedy by unit net, budget + capacity) ---
+      function allocate(cands) {
+        cands.sort((a, b) => b.unitNet - a.unitNet);
+        let remaining = state.budget;
+        let slotsUsed = 0;
+        const buyList = [];
+        for (const c of cands) {
+          if (remaining < 1) break;
+          const bySlots = cap - slotsUsed;
+          const byBudget = Math.floor(remaining / c.cost);
+          const qty = Math.min(c.avail, byBudget, bySlots);
+          if (qty <= 0) continue;
+          buyList.push({
+            name: c.name,
+            qty,
+            cost: c.cost,
+            unitNet: c.unitNet,
+            profit: c.unitNet * qty,
+            spent: c.cost * qty,
+            note: c.note,
+            dep: c.departureMin != null ? c.departureMin : null,
+            after: c.afterRestockMin != null ? c.afterRestockMin : null,
+            conf: c.conf || null,
+          });
+          remaining -= c.cost * qty;
+          slotsUsed += qty;
+        }
+        let tripProfit = 0,
+          budgetSpent = 0;
+        for (const b of buyList) {
+          tripProfit += b.profit;
+          budgetSpent += b.spent;
+        }
+        return { buyList, tripProfit, budgetSpent, slots: slotsUsed };
+      }
+
+      const timed = timedCands.length ? allocate(timedCands) : null;
+      const now = nowCands.length ? allocate(nowCands) : null;
+      const timedFits =
+        timed && timed.buyList.length
+          ? timedCands.every((c) => c.departureMin >= 0 && c.arrivalMin <= sleepMin)
+          : false;
+      const nowFits = now && now.buyList.length ? oneWay <= sleepMin : false;
+
+      // Pick the country's best scenario (profit-first, prefer sleep-fitting;
+      // on an exact tie prefer leaving now — no alarm needed).
+      let best = null,
+        bestKind = null;
+      for (const kind of ["now", "timed"]) {
+        const sc = kind === "timed" ? timed : now;
+        if (!sc || !sc.buyList.length) continue;
+        const fits = kind === "timed" ? timedFits : nowFits;
+        const profitNet = sc.tripProfit - travelCost;
+        if (
+          !best ||
+          (fits && !best.fits) ||
+          (fits === best.fits && profitNet > best.profitNet)
+        ) {
+          best = { ...sc, profitNet, travelCost, fits };
+          bestKind = kind;
+        }
+      }
+      if (!best) continue;
+
+      rows.push({
+        key,
+        name: dc.name,
+        city: dc.city,
+        oneWay,
+        travelCost,
+        kind: bestKind,
+        fits: best.fits,
+        profitNet: best.profitNet,
+        tripProfit: best.tripProfit,
+        budgetSpent: best.budgetSpent,
+        slots: best.slots,
+        timedCands,
+        nowCands,
+        buyList: best.buyList,
+        top: best.buyList.slice(0, 3),
+        timed,
+        now,
+      });
+    }
+
+    rows.sort((a, b) => b.profitNet - a.profitNet);
+    const fitting = rows.filter((r) => r.fits);
+    const chosen = fitting.length ? fitting[0] : rows[0];
+    return { rows, chosen, fitsInSleep: fitting.length > 0 };
+  }
+  // Back-compat alias used by renderResults.
+  function sleepRecommendation(abroad, items, models) {
+    return computeSleepPlan(abroad, items, models);
   }
 
   // ========== RENDER STATE ==========
@@ -400,9 +838,27 @@
   function colorFor(v) {
     return v >= 0 ? "#28a745" : "#dc3545";
   }
+  function landingTag(ld) {
+    if (!ld) return "";
+    if (ld.status === "restock") {
+      const before = ld.beforeLanding != null ? ld.beforeLanding : "?";
+      const inMin = ld.restockIn != null ? ld.restockIn : "?";
+      const conf = ld.conf ? ld.conf.label : "";
+      return `<span style="color:#c9a227;font-size:10px;" title="Restocks in ~${inMin}m from now (~${before}m before you land) — confidence: ${conf}">🟡 restocks ~${before}m before you land${conf ? " · " + conf : ""}</span>`;
+    }
+    if (ld.status === "instock" && ld.depletion) {
+      if (ld.depletion.sellsOutBeforeLand)
+        return `<span style="color:#d8736a;font-size:10px;" title="In stock now, but predicted sold out ~${ld.depletion.beforeLanding}m before you land">🔴 depletes ~${ld.depletion.beforeLanding}m before you land</span>`;
+      if (ld.depletion.beforeLanding != null)
+        return `<span style="color:#51c97a;font-size:10px;" title="In stock; predicted to sell out ~${ld.depletion.beforeLanding}m after you land">🟢 in stock · sells out ~${ld.depletion.beforeLanding}m after you land</span>`;
+    }
+    if (ld.status === "instock")
+      return '<span style="color:#28a745;font-size:10px;">🟢 in stock</span>';
+    return '<span style="color:#dc3545;font-size:10px;">🔴 empty</span>';
+  }
 
   // ========== SUMMARY (recommended route + sleep) ==========
-  function buildSummary(computed, sleep) {
+  function buildSummary(computed, sleep, nerve) {
     const useWindow = computed.windowMin != null;
     const best = computed.rows[0];
     const second = computed.rows[1];
@@ -420,7 +876,12 @@
           " trips in your " +
           hours(computed.windowMin) +
           " active window"
-        : "💰 " + signed(best.tripProfitNet) + " per trip · " + pphStr(best.pph);
+        : "💰 " +
+          signed(best.tripProfitNet) +
+          " per trip · " +
+          pphStr(best.pph) +
+          " · ROI " +
+          (best.roi != null ? best.roi.toFixed(1) + "%" : "—");
       html += `<div class="ttp-reco" style="background:rgba(40,167,69,0.12);border:1px solid rgba(40,167,69,0.5);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
       html += `<div style="font-weight:bold;color:#28a745;">★ Recommended route${useWindow ? " (active window)" : ""}</div>`;
       html += `<div><b>${best.name} (${best.city})</b> — ${useWindow ? metric : ""}</div>`;
@@ -428,28 +889,56 @@
       if (second) {
         html += `<div style="color:#bbb;font-size:12px;margin-top:4px;">Runner-up: <b>${second.name}</b> — ${signed(second.tripProfitNet)}/trip · ${pphStr(second.pph)}</div>`;
       }
+      if (best && best.nerve && typeof best.nerve.now === "number") {
+        const n = best.nerve;
+        if (n.waste > state.nerveWasteLimit) {
+          const doSpend = Math.max(0, n.waste - state.nerveWasteLimit);
+          html += `<div style="color:#e2a03f;font-size:12px;margin-top:4px;">🧠 Nerve ${n.now}/${n.max} — this RT wastes <b>~${n.waste}</b> nerve. Spend <b>${doSpend}</b> (down to ~${n.spendTo}) before leaving to avoid capping mid-flight.</div>`;
+        }
+      }
       html += `</div>`;
     } else {
       html += `<div style="color:#dc3545;padding:6px;">No profitable routes found with current net% / budget / capacity.</div>`;
     }
 
-    // Sleep recommendation (long-haul, one-way)
-    if (sleep && sleep.list.length) {
+    // Sleep plan — most profitable item that will be stocked when you land
+    if (sleep && sleep.rows.length) {
       const c = sleep.chosen;
-      const fits = c.oneWay <= state.sleepHours * 60;
-      const note =
+      const top =
+        c.top && c.top.length
+          ? c.top.map((t) => `${t.name} ×${t.qty}${t.after != null ? ` (${t.after}m after restock)` : ""}`).join(", ")
+          : "—";
+      const timedPick = c.kind === "timed" && c.buyList[0] && c.buyList[0].dep != null;
+      const depItem = timedPick ? c.buyList[0] : null;
+      const confLbl =
+        depItem && depItem.conf && depItem.conf.level !== "high"
+          ? ` · <span style="color:#c9a227;">${depItem.conf.label} confidence</span>`
+          : "";
+      const departTxt = timedPick
+        ? `Depart in <b>${hours(depItem.dep)}</b> — land <b>${depItem.after}m</b> after restock${confLbl}`
+        : "Depart <b>now</b> (stock verified at arrival)";
+      const fitsTxt =
         state.sleepHours > 0
-          ? fits
-            ? `Fits your ${state.sleepHours}h sleep — set an alarm and wake as you land 🛬`
-            : `Flight (${hours(c.oneWay)}) is longer than your ${state.sleepHours}h sleep — will overrun`
-          : "Set sleep hours to auto-pick a long-haul";
+          ? c.fits
+            ? `Fits your ${state.sleepHours}h sleep — set an alarm 🛬`
+            : `Arrival overruns your ${state.sleepHours}h sleep — will wake mid-trip`
+          : "Set sleep hours to time the restock";
       html += `<div class="ttp-sleep" style="background:rgba(79,195,247,0.10);border:1px solid rgba(79,195,247,0.45);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
-      html += `<div style="font-weight:bold;color:#4fc3f7;">😴 Sleep flight (long-haul, one-way — you're asleep on the way out)</div>`;
-      html += `<div>Fly to <b>${c.name} (${c.city})</b> — one-way ${hours(c.oneWay)}${c.buffer ? " (+ " + c.buffer + "m buy buffer)" : ""}</div>`;
-      html += `<div style="color:#bbb;font-size:12px;">${note} · Best long-hauls: ${sleep.list
-        .slice(0, 3)
-        .map((r) => r.name + " (" + hours(r.oneWay) + ")")
-        .join(", ")}</div>`;
+      html += `<div style="font-weight:bold;color:#4fc3f7;">😴 Sleep plan — best item stocked at arrival</div>`;
+      html += `<div>Fly to <b>${c.name} (${c.city})</b> — one-way ${hours(c.oneWay)} · ${departTxt}</div>`;
+      html += `<div style="color:#bbb;font-size:12px;">💰 ${signed(c.profitNet)} net (spend ${money(c.budgetSpent)}, ${c.slots} slots) · Buy: ${top}</div>`;
+      html += `<div style="color:#bbb;font-size:12px;">${fitsTxt}</div>`;
+      if (sleep.rows.length > 1) {
+        html += `<div style="color:#888;font-size:11px;margin-top:3px;">Alternatives: ${sleep.rows
+          .slice(1, 4)
+          .map((r) => `${r.name} ${signed(r.profitNet)}${r.fits ? "" : " ⚠overrun"}`)
+          .join(" · ")}</div>`;
+      }
+      html += `</div>`;
+    } else if (sleep && !sleep.rows.length) {
+      html += `<div class="ttp-sleep" style="background:rgba(79,195,247,0.10);border:1px solid rgba(79,195,247,0.45);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
+      html += `<div style="font-weight:bold;color:#4fc3f7;">😴 Sleep plan</div>`;
+      html += `<div style="color:#bbb;font-size:12px;">No item will be profitably in stock at any destination within your settings (budget/capacity/net%/restock confidence).</div>`;
       html += `</div>`;
     }
 
@@ -489,7 +978,7 @@
       const isBest = r === computed.rows[0];
       html += `<tr style="border-bottom:1px solid rgba(255,255,255,0.06);${isBest ? "background:rgba(40,167,69,0.08);" : ""}">`;
       html += `<td style="padding:5px 6px;"><b style="color:#f2f2f2;">${r.name}</b><br><span style="color:#c9c9c9;font-size:11px;">${r.city}</span></td>`;
-      html += `<td style="padding:5px 6px;white-space:nowrap;">${hours(r.roundTripMin)}<br><span style="color:#888;font-size:11px;">1-way ${hours(r.oneWay)}${r.travelCost ? " · cost " + money(r.travelCost) : ""}</span></td>`;
+      html += `<td style="padding:5px 6px;white-space:nowrap;"><span style="color:#f2f2f2;font-weight:600;">${hours(r.roundTripMin)}</span><br><span style="color:#b7bdc5;font-size:11px;">1-way ${hours(r.oneWay)}${r.travelCost ? " · cost " + money(r.travelCost) : ""}</span></td>`;
       html += `<td style="padding:5px 6px;white-space:nowrap;color:${colorFor(r.tripProfitNet)};font-weight:bold;">${signed(r.tripProfitNet)}</td>`;
       html += `<td style="padding:5px 6px;white-space:nowrap;color:${colorFor(r.pph)};">${pphStr(r.pph)}</td>`;
       html += `<td style="padding:5px 6px;white-space:nowrap;color:${colorFor(r.windowProfit)};">${computed.windowMin != null ? signed(r.windowProfit) + ' <span style="color:#888;font-size:11px;">(' + r.trips + "×)</span>" : "—"}</td>`;
@@ -498,7 +987,7 @@
       html += `<td style="padding:5px 6px;">`;
       if (r.top.length) {
         r.top.forEach((t, i) => {
-          html += `<div style="${i ? "margin-top:2px;" : ""}"><span style="color:#ddd;">${t.name}</span> <span style="color:#888;">×${t.qty}</span> <span style="color:${colorFor(t.unitNet)};font-size:11px;">@${signed(t.unitNet)}</span></div>`;
+          html += `<div style="${i ? "margin-top:2px;" : ""}"><span style="color:#ddd;">${t.name}</span> <span style="color:#888;">×${t.qty}</span> <span style="color:${colorFor(t.unitNet)};font-size:11px;">@${signed(t.unitNet)}</span> ${landingTag(t.landing)}</div>`;
         });
         if (r.top.length < r.buyList.length)
           html += `<div style="color:#888;font-size:11px;">+${r.buyList.length - r.top.length} more</div>`;
@@ -532,14 +1021,23 @@
     }
     let computed;
     try {
-      computed = computeDestinations(lastData.abroad, lastData.items);
+      computed = computeDestinations(
+        lastData.abroad,
+        lastData.items,
+        lastData.model || {},
+        lastData.nerve,
+      );
     } catch (e) {
       if (statusEl)
         statusEl.innerHTML = '<span style="color:#dc3545;">Error: ' + (e.message || e) + "</span>";
       return;
     }
-    const sleep = sleepRecommendation(computed.rows);
-    buildSummary(computed, sleep);
+    const sleep = sleepRecommendation(
+      lastData.abroad,
+      lastData.items,
+      lastData.model || {},
+    );
+    buildSummary(computed, sleep, lastData.nerve);
     buildTable(computed);
     updateStatus();
     if (statusEl) statusEl.style.color = "#bbb";
@@ -559,6 +1057,14 @@
       "% · budget " +
       money(state.budget);
     statusEl.innerHTML = `Data ${age >= 0 ? age + "s old" : "—"} · ${mode}`;
+    let suff = state.respectStock ? " · stock@arrival" : "";
+    if (lastData && lastData.nerve)
+      suff +=
+        " · nerve " +
+        lastData.nerve.nerve +
+        "/" +
+        (lastData.nerve.nerve_maximum || 100);
+    if (suff) statusEl.innerHTML += suff;
   }
 
   // ========== LOAD / REFRESH ==========
@@ -575,14 +1081,19 @@
     }
     if (statusEl)
       statusEl.innerHTML =
-        '<span style="color:#4fc3f7;">⏳ Fetching YATA abroad prices + Torn item values…</span>';
+        '<span style="color:#4fc3f7;">⏳ Fetching abroad prices + item values + restock/nerve…</span>';
 
     try {
-      const [abroad, items] = await Promise.all([fetchAbroad(force), fetchItems(force)]);
+      const [abroad, items, model, nerve] = await Promise.all([
+        fetchAbroad(force),
+        fetchItems(force),
+        fetchModelSafe(force),
+        fetchNerveSafe(force),
+      ]);
       if (seq !== updateSeq) return;
       const itemMap = {};
       for (const [id, it] of Object.entries(items.items || {})) itemMap[parseInt(id)] = it;
-      lastData = { abroad, items: itemMap, fetchedAt: Date.now() };
+      lastData = { abroad, items: itemMap, model, nerve, fetchedAt: Date.now() };
       renderResults();
     } catch (e) {
       if (seq !== updateSeq) return;
@@ -799,6 +1310,21 @@
       state.activeStart = startInp.value;
       onSettingsChange();
     });
+    const nowBtn = document.createElement("button");
+    nowBtn.textContent = "Now";
+    nowBtn.title = "Set Active start to the current time";
+    nowBtn.style.cssText =
+      "padding:4px 8px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:11px;";
+    nowBtn.addEventListener("click", () => {
+      state.activeStart = nowHHMM();
+      startInp.value = state.activeStart;
+      saveState();
+      onSettingsChange();
+    });
+    const startWrap = document.createElement("div");
+    startWrap.style.cssText = "display:flex;gap:4px;align-items:flex-end;";
+    startWrap.appendChild(startInp);
+    startWrap.appendChild(nowBtn);
     const endInp = document.createElement("input");
     endInp.type = "time";
     endInp.value = state.activeEnd;
@@ -806,6 +1332,59 @@
     endInp.style.width = "90px";
     endInp.addEventListener("change", () => {
       state.activeEnd = endInp.value;
+      onSettingsChange();
+    });
+
+    const respectCb = document.createElement("input");
+    respectCb.type = "checkbox";
+    respectCb.checked = state.respectStock;
+    respectCb.style.cssText = "cursor:pointer;";
+    respectCb.addEventListener("change", () => {
+      state.respectStock = respectCb.checked;
+      onSettingsChange();
+    });
+    const swInp = numInput(
+      state.stockWindow,
+      -30,
+      1,
+      (v) => {
+        state.stockWindow = v;
+        onSettingsChange();
+      },
+      "50px",
+    );
+    const nwInp = numInput(
+      state.nerveWasteLimit,
+      0,
+      1,
+      (v) => {
+        state.nerveWasteLimit = Math.max(0, v || 0);
+        onSettingsChange();
+      },
+      "50px",
+    );
+    const keyInp = document.createElement("input");
+    keyInp.type = "password";
+    keyInp.placeholder = "API key (items + nerve)";
+    keyInp.value = state.apiKey || "";
+    keyInp.style.cssText = inputStyle();
+    keyInp.style.width = "120px";
+    keyInp.addEventListener("change", () => {
+      state.apiKey = keyInp.value.trim();
+      saveState();
+      loadData(true); // refetch so items/nerve use the new key
+    });
+    const confSel = document.createElement("select");
+    ["med", "high", "low"].forEach((v) => {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = v[0].toUpperCase() + v.slice(1);
+      confSel.appendChild(o);
+    });
+    confSel.value = state.restockConfidence || "med";
+    confSel.style.cssText = selStyle();
+    confSel.addEventListener("change", () => {
+      state.restockConfidence = confSel.value;
       onSettingsChange();
     });
 
@@ -829,9 +1408,14 @@
     ctl.appendChild(field("Net % (trade)", netInp));
     ctl.appendChild(field("Budget (capital)", budInp));
     ctl.appendChild(field("Buy buffer (min)", bufInp));
-    ctl.appendChild(field("Active start", startInp));
+    ctl.appendChild(field("Active start", startWrap));
     ctl.appendChild(field("Active end", endInp));
     ctl.appendChild(field("Sleep (h)", sleepInp));
+    ctl.appendChild(field("Stock on arrival", respectCb, "justify-content:flex-end;"));
+    ctl.appendChild(field("Stock window (min)", swInp));
+    ctl.appendChild(field("Restock confidence", confSel));
+    ctl.appendChild(field("Nerve waste allow", nwInp));
+    ctl.appendChild(field("API key", keyInp, "flex-basis:160px;"));
     ctl.appendChild(field("Auto-refresh", autoCb, "justify-content:flex-end;"));
     ctl.appendChild(refreshBtn);
 
