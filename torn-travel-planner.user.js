@@ -171,6 +171,7 @@
   // ========== CACHES ==========
   const apiCache = {}; // url -> { data, ts }
   let lastData = null; // { abroad, items, fetchedAt }
+  let _ttpBackoffUntil = 0; // unix ms, 0 = clear (cooldown after Torn API error)
   let updateSeq = 0;
   let loading = false;
   let lastLoadAt = 0;
@@ -179,6 +180,9 @@
     const c = apiCache[key];
     return c && Date.now() - c.ts < CONFIG.cacheDuration ? c.data : null;
   }
+  function ttpInBackoff() { return Date.now() < _ttpBackoffUntil; }
+  function ttpApiOk() { _ttpBackoffUntil = 0; }
+  function ttpApiErr() { _ttpBackoffUntil = Date.now() + 300000; } // 5 min cooldown
 
   // ========== NETWORK ==========
   function gmFetch(url) {
@@ -251,24 +255,27 @@
   async function fetchNerve(force) {
     const key = state.apiKey;
     if (!key) return null;
+    if (!force && ttpInBackoff()) return null; // cool-down after error, skip
     const url = "https://api.torn.com/user/?selections=basic&key=" + encodeURIComponent(key);
     if (!force) {
       const cached = getCached(url);
       if (cached) return cached;
     }
-    const data = await gmFetch(url);
-    if (!data || data.error || data.nerve == null) return null;
-    apiCache[url] = { data: data, ts: Date.now() };
-    return data;
+    try {
+      const data = await gmFetch(url);
+      if (!data || data.error || data.nerve == null) { ttpApiErr(); return null; }
+      apiCache[url] = { data: data, ts: Date.now() };
+      ttpApiOk();
+      return data;
+    } catch (e) {
+      ttpApiErr();
+      return null;
+    }
   }
 
   // Non-fatal: a missing/invalid API key must not break price/stock planning.
   async function fetchNerveSafe(force) {
-    try {
-      return (await fetchNerve(force)) || null;
-    } catch (e) {
-      return null;
-    }
+    return (await fetchNerve(force)) || null;
   }
 
   async function fetchItems(force) {
@@ -279,11 +286,22 @@
     if (!force) {
       const cached = getCached(url);
       if (cached) return cached;
+      if (ttpInBackoff()) {
+        // Serve stale cache during cooldown rather than nothing.
+        const stale = apiCache[url];
+        if (stale) return stale.data;
+      }
     }
-    const data = await gmFetch(url);
-    if (!data || !data.items) throw new Error("Torn: unexpected response");
-    apiCache[url] = { data: data, ts: Date.now() };
-    return data;
+    try {
+      const data = await gmFetch(url);
+      if (!data || !data.items) { ttpApiErr(); throw new Error("Torn: unexpected response"); }
+      apiCache[url] = { data: data, ts: Date.now() };
+      ttpApiOk();
+      return data;
+    } catch (e) {
+      ttpApiErr();
+      throw e;
+    }
   }
 
   // ========== FORMATTING ==========
