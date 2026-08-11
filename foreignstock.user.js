@@ -1858,8 +1858,8 @@
             tfsMsg("");
             render(mp, "profit");
           })
-          .catch(function () {
-            tfsMsg("key error");
+          .catch(function (e) {
+            tfsMsg(e && e.message ? e.message : "key error");
             render({}, "stock");
           });
       }
