@@ -67,20 +67,21 @@ function buildDashboard_() {
   d.setColumnWidth(1, 240);
   d.setColumnWidth(2, 200);
 
-  // Color coding by status: gains green, losses red, zero flat.
+  // Color coding by status: gains green, losses red, zero flat. Conditional
+  // formatting is a SHEET-level API — Range has no setConditionalFormatRules —
+  // and one call replaces the whole rule set, so the money and status rules are
+  // merged into a single sheet call below.
   var moneyRanges = [4, 17, 20, 21, 22, 25, 26, 27, 33]
     .map(function (r) { return d.getRange(r, 2); });
-  d.getRange(4, 2).setConditionalFormatRules(cfMoneyRules_(moneyRanges));
-
   var status = d.getRange(5, 2);
-  status.setConditionalFormatRules([
+  d.setConditionalFormatRules(cfMoneyRules_(moneyRanges).concat([
     SpreadsheetApp.newConditionalFormatRule()
       .whenTextEqualTo('▲ PROFITABLE').setBackground(CF_COLORS.pos).setRanges([status]).build(),
     SpreadsheetApp.newConditionalFormatRule()
       .whenTextEqualTo('▼ LOSING').setBackground(CF_COLORS.neg).setRanges([status]).build(),
     SpreadsheetApp.newConditionalFormatRule()
       .whenTextEqualTo('— FLAT').setBackground(CF_COLORS.neutral).setRanges([status]).build()
-  ]);
+  ]));
 }
 
 function rebuildDashboard() {

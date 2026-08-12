@@ -132,7 +132,8 @@ function buildCompare_() {
   if (rows.length) {
     sheet.getRange(2, 2, rows.length, 7).setNumberFormat('$#,##0');  // networth..cum
     var data = sheet.getRange(2, 3, rows.length, 6);   // delta .. cum_unrealized
-    data.setConditionalFormatRules(cfMoneyRules_(data));
+    // setConditionalFormatRules is a Sheet-level API (Ranges do not have it).
+    sheet.setConditionalFormatRules(cfMoneyRules_(data));
   }
 }
 
