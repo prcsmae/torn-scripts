@@ -40,6 +40,13 @@ function diagnoseSync() {
     lines.push('  !! In the FUTURE — it blocks every new log. Delete LAST_TS from');
     lines.push('     Script Properties and re-sync.');
   }
+  var backfill = Number(props.getProperty('BACKFILL_TO') || 0);
+  if (backfill) {
+    lines.push('BACKFILL_TO: ' + backfill + ' — older history is still being fetched;');
+    lines.push('  each Sync run continues it until the beginning is reached.');
+  } else {
+    lines.push('BACKFILL_TO: not set (history fully backfilled, or not started)');
+  }
 
   // Read-only row counts: never create tabs from a diagnostic.
   function rows_(name) {

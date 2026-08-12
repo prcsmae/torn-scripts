@@ -5,104 +5,142 @@
  * LAST_TS watermark has advanced past a stretch, so a bug here loses data forever
  * while a bug in rebuild costs a single rerun. Change this file carefully.
  *
- * The request is filtered to MONEY_CATS (Torn categories 14 "Money outgoing",
- * 17 "Money incoming", 138 "Vault", 145 "Offshore bank"), so every income,
- * expense and transfer entry is captured automatically — no per-type mapping
- * needed for coverage. The `cat` parameter accepts exactly one category id, so
- * each category is walked separately and the results are merged; the id-based
- * dedupe makes any overlap harmless.
- */
-
-/**
- * Incremental pull of user/log into RawLog, walking backwards with a `to` cursor
- * until it reaches the watermark or runs out of new entries. Deduplicates on
- * Torn's own log hash, so overlapping runs are harmless.
+ * Two passes:
+ *   1. Incremental — the newest entries after the LAST_TS watermark. Cheap:
+ *      usually one or two requests per category.
+ *   2. Backfill — older history below the oldest stored entry, walked over
+ *      successive runs with a BACKFILL_TO cursor until every category's true
+ *      beginning is reached. This is how a fresh ledger gets its history.
+ *
+ * The request is filtered to MONEY_CATS (14 "Money outgoing", 17 "Money incoming",
+ * 138 "Vault", 145 "Offshore bank") so every income, expense and transfer entry
+ * is captured. The `cat` parameter accepts exactly one category id, so each
+ * category is walked separately; the id-based dedupe makes any overlap harmless.
  */
 function syncLogs() {
   var props = PropertiesService.getScriptProperties();
   var sheet = tab_(TABS.RAW);
-  var from = Number(props.getProperty('LAST_TS') || 0);
+  var nowSec = Math.floor(Date.now() / 1000);
 
-  // A watermark in the future would silently filter out every new log forever
-  // (the API returns nothing after `from`). Self-heal back to a full pull and
-  // clear the stored value right away, so a mid-run failure can't leave it.
-  if (from > Math.floor(Date.now() / 1000)) {
-    Logger.log('LAST_TS ' + from + ' is in the future — resetting watermark.');
-    props.deleteProperty('LAST_TS');
-    from = 0;
-  }
-
-  // Seen-ID set, read straight off the sheet so it can never drift from reality.
-  var seen = {};
+  // Seen IDs + the oldest stored timestamp, read off the sheet so they can never
+  // drift from reality.
+  var seen = {}, minStored = Infinity;
   if (sheet.getLastRow() > 1) {
-    sheet.getRange(2, 10, sheet.getLastRow() - 1, 1).getValues().forEach(function (r) {
-      if (r[0]) seen[r[0]] = true;
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, 10).getValues().forEach(function (r) {
+      if (!r[0]) return;
+      seen[r[9]] = true;
+      if (r[0] < minStored) minStored = r[0];
     });
   }
 
-  var rows = [], maxTs = from;
-  var MAX_PAGES = 20;               // 2,000 entries per category per run
+  // A watermark in the future would silently filter out every new log forever —
+  // self-heal it. And an EMPTY RawLog must ignore the watermark entirely: a
+  // LAST_TS left over from an earlier run would otherwise block downloading the
+  // history this fresh sheet is missing.
+  var from = Number(props.getProperty('LAST_TS') || 0);
+  if (from > nowSec || minStored === Infinity) {
+    if (from > nowSec) props.deleteProperty('LAST_TS');
+    if (minStored === Infinity) props.deleteProperty('BACKFILL_TO');
+    from = 0;
+  }
 
+  var rows = [], maxTs = from, runMin = Infinity;
+  var MAX_PAGES = 20;               // 2,000 entries per category per pass
+
+  function consume(log) {
+    var oldest = Infinity, newInPage = 0;
+    log.forEach(function (e) {
+      if (e.timestamp < oldest) oldest = e.timestamp;
+      if (e.timestamp < runMin) runMin = e.timestamp;
+      if (seen[e.id]) return;
+      seen[e.id] = true;
+
+      var d = e.data || {};
+      var det = e.details || {};
+
+      // Item logs nest ids/quantities in an items array — lift the first one.
+      var itemId = firstKey_(d, ITEM_KEYS);
+      var qty = num_(firstKey_(d, QTY_KEYS));
+      if (Array.isArray(d.items) && d.items.length) {
+        if (!itemId) itemId = d.items[0].id || d.items[0].item;
+        if (!qty) {
+          qty = d.items.reduce(function (a, b) { return a + num_(b.qty); }, 0);
+        }
+      }
+
+      rows.push([
+        e.timestamp,
+        new Date(e.timestamp * 1000),
+        det.id,
+        det.category || '',
+        det.title || '',
+        num_(firstKey_(d, MONEY_KEYS)),
+        itemId || '',
+        d.item_name || '',
+        qty || 1,
+        e.id,
+        JSON.stringify(d)
+      ]);
+      newInPage++;
+      if (e.timestamp > maxTs) maxTs = e.timestamp;
+    });
+    return { oldest: oldest, newInPage: newInPage };
+  }
+
+  // ---- Pass 1: incremental, newest first --------------------------------
+  var capped = false;               // history deeper than this run's window
   MONEY_CATS.forEach(function (cat) {
     var cursorTo = 0;
-
     for (var page = 0; page < MAX_PAGES; page++) {
       // from = watermark - 1: the docs say from is exclusive (\"after this time\")
       // but the live API is inclusive, so the watermark second must be re-fetched
       // under either behavior. Dedupe makes the overlap harmless.
-      var url = API + '/user/log?key=' + key_()
-              + '&cat=' + cat
-              + (from ? '&from=' + (from - 1) : '')
+      var url = API + '/user/log?key=' + key_() + '&cat=' + cat
+              + (from && page === 0 ? '&from=' + (from - 1) : '')
               + (cursorTo ? '&to=' + cursorTo : '')
               + '&limit=100';
       var log = fetchJson_(url).log || [];
       if (!log.length) break;
-
-      var oldest = Infinity, newInPage = 0;
-
-      log.forEach(function (e) {
-        if (e.timestamp < oldest) oldest = e.timestamp;
-        if (seen[e.id]) return;
-        seen[e.id] = true;
-
-        var d = e.data || {};
-        var det = e.details || {};
-
-        // Item logs nest ids/quantities in an items array — lift the first one.
-        var itemId = firstKey_(d, ITEM_KEYS);
-        var qty = num_(firstKey_(d, QTY_KEYS));
-        if (Array.isArray(d.items) && d.items.length) {
-          if (!itemId) itemId = d.items[0].id || d.items[0].item;
-          if (!qty) {
-            qty = d.items.reduce(function (a, b) { return a + num_(b.qty); }, 0);
-          }
-        }
-
-        rows.push([
-          e.timestamp,
-          new Date(e.timestamp * 1000),
-          det.id,
-          det.category || '',
-          det.title || '',
-          num_(firstKey_(d, MONEY_KEYS)),
-          itemId || '',
-          d.item_name || '',
-          qty || 1,
-          e.id,
-          JSON.stringify(d)
-        ]);
-        newInPage++;
-        if (e.timestamp > maxTs) maxTs = e.timestamp;
-      });
-
+      var r = consume(log);
       if (log.length < 100) break;  // that was the last page
-      if (!newInPage) break;        // nothing new — already have this stretch
-      if (oldest <= from) break;    // reached the watermark
-
-      cursorTo = oldest;            // step further back, dedupe handles the overlap
+      if (!r.newInPage) break;      // nothing new — already have this stretch
+      if (r.oldest <= from) break;  // reached the watermark
+      if (page === MAX_PAGES - 1) { capped = true; break; }  // more history below
+      cursorTo = r.oldest;          // step further back, dedupe handles the overlap
       Utilities.sleep(700);         // stay comfortably under 100 requests/minute
     }
   });
+
+  // ---- Pass 2: backfill older history below the oldest stored entry ------
+  // BACKFILL_TO is the oldest timestamp fetched so far; each run fetches the
+  // window just below it and advances the cursor. Deleted once every category
+  // has no entries left (a short or empty page means that category is done).
+  var backfillTo = Number(props.getProperty('BACKFILL_TO') || 0);
+  if (!backfillTo && capped) {
+    var floor = Math.min(minStored, runMin);
+    backfillTo = isFinite(floor) ? floor : 0;
+  }
+
+  var moreHistory = false, backfillFloor = backfillTo;
+  if (backfillTo > 0) {
+    MONEY_CATS.forEach(function (cat) {
+      var cursor = backfillTo;
+      for (var page = 0; page < MAX_PAGES; page++) {
+        var url = API + '/user/log?key=' + key_() + '&cat=' + cat
+                + '&to=' + cursor + '&limit=100';
+        var log = fetchJson_(url).log || [];
+        if (!log.length) break;
+        var r = consume(log);
+        if (r.oldest < backfillFloor) backfillFloor = r.oldest;
+        if (log.length === 100) moreHistory = true;
+        if (log.length < 100) break;      // this category's history is exhausted
+        cursor = r.oldest;                // keep walking further back
+        Utilities.sleep(700);
+      }
+    });
+    if (moreHistory) props.setProperty('BACKFILL_TO', String(backfillFloor));
+    else props.deleteProperty('BACKFILL_TO');
+  }
 
   if (rows.length) {
     rows.sort(function (a, b) { return a[0] - b[0]; });

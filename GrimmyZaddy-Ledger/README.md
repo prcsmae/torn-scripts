@@ -135,6 +135,16 @@ RawLog row 1 is data instead of headers. The two most common causes:
 Also confirm you ran Torn > 1. Setup sheets before the first sync, so RawLog has
 its header row.
 
+**Old logs are not showing up.** The sync is incremental by design (the watermark
+only asks for what's new) but it **backfills history automatically**: with an
+empty RawLog it ignores the watermark and walks back from the present, then
+continues on each run through a `BACKFILL_TO` cursor until every category's true
+beginning is reached. Run Sync now a few times — each run pulls another ~2,000
+entries per category further back. Diagnose sync shows whether backfilling is
+still in progress (`BACKFILL_TO: not set` means it's done). While backfilling,
+prefer manual Sync runs over the hourly trigger: a backfill run can make up to
+~160 API requests, which is fine for the daily budget but heavy for the trigger.
+
 **Use a fresh Google Sheet.** The RawLog column layout differs from the older
 trading-ledger version of this script (same column count, different meaning), so
 a RawLog written by the old version would silently shift under a new rebuild.
