@@ -22,3 +22,66 @@ function inspectLogType() {
   }).join('\n\n---\n\n');
   ui.alert('Log type ' + id + ' — ' + title, samples, ui.ButtonSet.OK);
 }
+
+/**
+ * One-shot health check for "sync added 0 entries". Reports the watermark, the
+ * key, what the API actually returns per money category, and whether RawLog is
+ * shaped correctly. Run it before touching anything else.
+ */
+function diagnoseSync() {
+  var ui = SpreadsheetApp.getUi();
+  var props = PropertiesService.getScriptProperties();
+  var nowSec = Math.floor(Date.now() / 1000);
+  var lines = [];
+
+  var from = Number(props.getProperty('LAST_TS') || 0);
+  lines.push('LAST_TS watermark: ' + (from || 'not set'));
+  if (from > nowSec) {
+    lines.push('  !! In the FUTURE — it blocks every new log. Delete LAST_TS from');
+    lines.push('     Script Properties and re-sync.');
+  }
+
+  // Read-only row counts: never create tabs from a diagnostic.
+  function rows_(name) {
+    var s = ss_().getSheetByName(name);
+    return s ? Math.max(0, s.getLastRow() - 1) : 0;
+  }
+  lines.push('RawLog rows: ' + rows_(TABS.RAW));
+  var raw = ss_().getSheetByName(TABS.RAW);
+  if (raw && raw.getLastRow() >= 1) {
+    var first = raw.getRange(1, 1, 1, 3).getValues()[0];
+    var isData = typeof first[0] === 'number' && first[0] > 1e9;
+    if (isData) {
+      lines.push('  !! Row 1 is DATA, not headers — run 1. Setup sheets first, or');
+      lines.push('     rebuild will start reading at row 2 and miss it.');
+    }
+  }
+  lines.push('Income rows: ' + rows_(TABS.INCOME));
+  lines.push('Expenses rows: ' + rows_(TABS.EXPENSE));
+  lines.push('');
+
+  try {
+    key_();
+    lines.push('API key: found');
+  } catch (e) {
+    lines.push('API key: ' + e.message);
+    ui.alert('Diagnose sync', lines.join('\n'), ui.ButtonSet.OK);
+    return;
+  }
+
+  MONEY_CATS.forEach(function (cat) {
+    try {
+      var j = fetchJson_(API + '/user/log?key=' + key_() + '&cat=' + cat + '&limit=1');
+      var log = j.log || [];
+      var newest = log.length ? log[0].timestamp : 0;
+      var hint = '';
+      if (!log.length) hint = ' — no entries in this category';
+      else if (from && newest <= from) hint = ' — newest is at/before the watermark (nothing new to fetch)';
+      lines.push('cat ' + cat + ': API returned ' + log.length + (log.length ? ' (newest ' + newest + ')' : '') + hint);
+    } catch (e) {
+      lines.push('cat ' + cat + ': ERROR ' + (e.message || e));
+    }
+  });
+
+  ui.alert('Diagnose sync', lines.join('\n'), ui.ButtonSet.OK);
+}

@@ -98,9 +98,10 @@ flight costs and a user ID as four million of rent.)
 ## Efficiency
 
 - **API v2 filtered by Torn's money categories.** `syncLogs` requests only
-  categories 14 ("Money outgoing") and 17 ("Money incoming"), so every
-  income/expense entry is captured automatically — no per-type mapping is needed
-  for coverage, and nothing irrelevant is downloaded or stored.
+  categories 14 ("Money outgoing"), 17 ("Money incoming"), 138 ("Vault") and
+  145 ("Offshore bank"), so every income, expense and transfer entry is captured
+  automatically — no per-type mapping is needed for coverage, and nothing
+  irrelevant is downloaded or stored.
 - **No item reference.** Setup skips Torn's tens-of-thousands-row items list —
   this ledger only needs the money amount and title, which every log carries.
 - **Batched sheet I/O** — read a range once, build an array, write once.
@@ -118,6 +119,21 @@ flight costs and a user ID as four million of rent.)
 
 Start with the Exceptions tab, which flags most self-diagnosable problems with an
 actionable message. For raw field shapes, use Torn > 5. Inspect a log type.
+
+**Sync adds 0 entries.** Run Torn > 8. Diagnose sync. It reports the watermark,
+whether the API key is present, what the API returns per category, and whether
+RawLog row 1 is data instead of headers. The two most common causes:
+
+1. **Stale files in the Apps Script project.** Apps Script loads the last file
+   that defines a function name — a leftover `Code.gs` or an old copy of a file
+   silently overrides the new one. Delete everything and paste the current files
+   fresh (including `private.gs`).
+2. **`LAST_TS` in the future.** A watermark past the current time makes the API
+   return nothing. Delete `LAST_TS` from Script Properties (or just wait — the
+   sync now detects and resets a future watermark itself).
+
+Also confirm you ran Torn > 1. Setup sheets before the first sync, so RawLog has
+its header row.
 
 **Use a fresh Google Sheet.** The RawLog column layout differs from the older
 trading-ledger version of this script (same column count, different meaning), so

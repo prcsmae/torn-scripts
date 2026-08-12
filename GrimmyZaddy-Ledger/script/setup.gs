@@ -25,10 +25,12 @@ function setupSheets() {
 /**
  * Pull torn/logtypes into the LogTypeMap tab, preserving your direction edits.
  *
- * Directions come from Torn's own categorization: log types in category 14
- * ("Money outgoing") default to expense, category 17 ("Money incoming") to income,
- * everything else to ignore. No title guessing for money types — Torn already
- * classified them, and its word for it is more reliable than ours.
+ * Directions come from Torn's own categorization, not title guessing:
+ *   - category 14 ("Money outgoing") -> expense
+ *   - category 17 ("Money incoming") -> income
+ *   - transfer categories (Vault, Offshore bank) -> expense for deposit/invest,
+ *     income for withdraw/interest
+ *   - everything else -> ignore
  *
  * Deliberately does NOT fetch torn/items: that list is tens of thousands of rows,
  * and this ledger only needs the money amount and the log title, both of which
@@ -52,18 +54,15 @@ function refreshReference() {
     });
   }
 
-  // Which log types belong to which money category.
-  var outIds = categoryTypeIds_(k, 14);
-  var inIds  = categoryTypeIds_(k, 17);
+  var catNames = categoryNames_();          // catId -> 'Money outgoing', 'Vault'...
+  var members = {};                         // catId -> {logTypeId: true}
+  MONEY_CATS.forEach(function (c) { members[c] = categoryTypeIds_(k, c); });
 
   var rows = types.map(function (t) {
     if (existing[String(t.id)]) return existing[String(t.id)];
     var id = String(t.id);
-    var category = outIds[id] ? 'Money outgoing' : (inIds[id] ? 'Money incoming' : '-');
-    var direction = outIds[id] ? 'expense'
-                  : inIds[id] ? 'income'
-                  : guessDirection_(t.title);
-    return [Number(t.id), t.title, direction, guessBucket_(t.title), '', category];
+    var dc = directionAndCategory_(id, t.title, members, catNames);
+    return [Number(t.id), t.title, dc.direction, guessBucket_(t.title), '', dc.category];
   });
   rows.sort(function (a, b) { return a[0] - b[0]; });
 
@@ -71,11 +70,29 @@ function refreshReference() {
   writeRows_(sheet, rows);
 }
 
-/**
- * id -> true lookup of the log types in one category. A transient failure here
- * returns an empty set rather than aborting the whole refresh: those types then
- * fall back to title guessing, and re-running Setup later repairs them.
- */
+/** Direction + category label for a log type id, driven by its Torn category. */
+function directionAndCategory_(id, title, members, catNames) {
+  // First match in MONEY_CATS order wins — some types belong to more than one
+  // money category (e.g. 6012 offshore interest is in 17 and 145).
+  var catId = null;
+  for (var i = 0; i < MONEY_CATS.length; i++) {
+    var c = MONEY_CATS[i];
+    if (members[c] && members[c][id]) { catId = c; break; }
+  }
+  if (catId === null) {
+    return { direction: guessDirection_(title), category: '-' };
+  }
+  var t = String(title).toLowerCase();
+  var direction;
+  if (catId === 14)               direction = 'expense';
+  else if (catId === 17)          direction = 'income';
+  else if (/deposit|invest/.test(t))  direction = 'expense';   // transfer in
+  else if (/withdraw|interest/.test(t)) direction = 'income';  // transfer out
+  else                            direction = 'ignore';        // e.g. 'Vault sharing'
+  return { direction: direction, category: catNames[catId] || String(catId) };
+}
+
+/** id -> true lookup of the log types in one category. */
 function categoryTypeIds_(k, catId) {
   var set = {};
   try {
@@ -83,6 +100,16 @@ function categoryTypeIds_(k, catId) {
     types.forEach(function (t) { set[String(t.id)] = true; });
   } catch (e) { /* degrade to title guessing */ }
   return set;
+}
+
+/** catId -> category title, for the LogTypeMap category column. */
+function categoryNames_() {
+  var map = {};
+  try {
+    var cats = fetchJson_(API + '/torn/logcategories?key=' + key_()).logcategories || [];
+    cats.forEach(function (c) { map[c.id] = c.title; });
+  } catch (e) { /* categories stay '-' */ }
+  return map;
 }
 
 /**
@@ -122,5 +149,6 @@ function guessBucket_(title) {
   if (/trade/.test(t))                                               return 'Trade';
   if (/crime/.test(t))                                               return 'Crime';
   if (/casino|poker|slots|blackjack|roulette|lottery/.test(t))       return 'Casino';
+  if (/vault/.test(t))                                               return 'Vault';
   return 'Other';
 }

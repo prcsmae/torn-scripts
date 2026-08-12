@@ -5,11 +5,12 @@
  * LAST_TS watermark has advanced past a stretch, so a bug here loses data forever
  * while a bug in rebuild costs a single rerun. Change this file carefully.
  *
- * The request is filtered to MONEY_CATS (Torn categories 14 "Money outgoing" and
- * 17 "Money incoming"), so every income/expense entry is captured automatically —
- * no per-type mapping needed for coverage. The `cat` parameter accepts exactly one
- * category id, so each category is walked separately and the results are merged;
- * the id-based dedupe makes any overlap harmless.
+ * The request is filtered to MONEY_CATS (Torn categories 14 "Money outgoing",
+ * 17 "Money incoming", 138 "Vault", 145 "Offshore bank"), so every income,
+ * expense and transfer entry is captured automatically — no per-type mapping
+ * needed for coverage. The `cat` parameter accepts exactly one category id, so
+ * each category is walked separately and the results are merged; the id-based
+ * dedupe makes any overlap harmless.
  */
 
 /**
@@ -21,6 +22,15 @@ function syncLogs() {
   var props = PropertiesService.getScriptProperties();
   var sheet = tab_(TABS.RAW);
   var from = Number(props.getProperty('LAST_TS') || 0);
+
+  // A watermark in the future would silently filter out every new log forever
+  // (the API returns nothing after `from`). Self-heal back to a full pull and
+  // clear the stored value right away, so a mid-run failure can't leave it.
+  if (from > Math.floor(Date.now() / 1000)) {
+    Logger.log('LAST_TS ' + from + ' is in the future — resetting watermark.');
+    props.deleteProperty('LAST_TS');
+    from = 0;
+  }
 
   // Seen-ID set, read straight off the sheet so it can never drift from reality.
   var seen = {};

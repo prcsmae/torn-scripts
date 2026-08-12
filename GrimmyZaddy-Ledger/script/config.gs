@@ -43,10 +43,12 @@ var QTY_KEYS   = ['quantity', 'qty', 'amount'];
  * and /torn/{id}/logtypes: category 14 "Money outgoing" and category 17
  * "Money incoming" between them cover every money-moving log type (bazaar and
  * item-market buys/sells, trade money legs, casino, crime, bank, stocks, bounties,
- * property, church, jobs...). Extend if you also want e.g. vault (138) or
- * offshore bank (145) deposits tracked — those are transfers, not income/expense.
+ * property, church, jobs...). 138 (Vault) and 145 (Offshore bank) are transfers —
+ * money moved between your wallet and storage — also tracked so every movement
+ * of cash lands in the ledger. The cat param accepts one id, so the sync walks
+ * each category separately.
  */
-var MONEY_CATS = [14, 17];
+var MONEY_CATS = [14, 17, 138, 145];
 
 /**
  * Which LogTypeMap directions count as money moving. Anything else — item_loss,
