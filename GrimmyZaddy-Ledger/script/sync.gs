@@ -48,9 +48,12 @@ function syncLogs() {
   var MAX_PAGES = 20;               // 2,000 entries per run, well inside runtime limits
 
   for (var page = 0; page < MAX_PAGES; page++) {
+    // from = watermark - 1: the docs say from is exclusive ("after this time")
+    // but the live API is inclusive, so the watermark second must be re-fetched
+    // under either behavior. Dedupe makes the overlap harmless.
     var url = API + '/user/log?key=' + key_()
             + (logFilter ? '&log=' + logFilter.join(',') : '')
-            + (from ? '&from=' + from : '')
+            + (from ? '&from=' + (from - 1) : '')
             + (cursorTo ? '&to=' + cursorTo : '')
             + '&limit=100';
     var log = fetchJson_(url).log || [];
