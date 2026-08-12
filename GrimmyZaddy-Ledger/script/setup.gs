@@ -13,8 +13,11 @@ function setupSheets() {
   tab_(TABS.INCOME,  ['date', 'title', 'bucket', 'amount']);
   tab_(TABS.EXPENSE, ['date', 'title', 'bucket', 'amount']);
   tab_(TABS.EXCEPT,  ['date', 'log_type', 'title', 'problem', 'raw_data']);
+  tab_(TABS.NETWORTH, NETWORTH_HEADERS);
+  tab_(TABS.COMPARE, COMPARE_HEADERS);
 
   refreshReference();
+  buildCompare_();
   buildDashboard_();
   SpreadsheetApp.getUi().alert(
     'Setup done.\n\nLogTypeMap directions for every money-moving log type are ' +

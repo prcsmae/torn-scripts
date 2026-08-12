@@ -7,12 +7,14 @@
  */
 
 var TABS = {
-  RAW:     'RawLog',
-  TYPES:   'LogTypeMap',
-  INCOME:  'Income',
-  EXPENSE: 'Expenses',
-  EXCEPT:  'Exceptions',
-  DASH:    'Dashboard'
+  RAW:      'RawLog',
+  TYPES:    'LogTypeMap',
+  INCOME:   'Income',
+  EXPENSE:  'Expenses',
+  EXCEPT:   'Exceptions',
+  DASH:     'Dashboard',
+  NETWORTH: 'Networth',
+  COMPARE:  'Compare'
 };
 
 // Torn API v2. The log selection requires a full-access key.
@@ -49,6 +51,28 @@ var QTY_KEYS   = ['quantity', 'qty', 'amount'];
  * each category separately.
  */
 var MONEY_CATS = [14, 17, 138, 145];
+
+/**
+ * Log types that move money BETWEEN networth buckets without changing the total
+ * (bank invest/withdraw, cashier's checks, vault, offshore bank, loans). They
+ * must be excluded from the Compare view's "realized" figure, otherwise
+ * Δnetworth = realized + unrealized would never balance: depositing to the bank
+ * looks like an expense and withdrawing like income, while networth is flat.
+ *
+ * Verified against /torn/{14,17,138,145}/logtypes. Company (6284/6285) and
+ * bookie deposits are deliberately left out: networth's treatment of those
+ * balances is ambiguous, and including or excluding them only shifts the
+ * realized/unrealized split — never the total.
+ */
+var TRANSFER_TYPES = {
+  '5450': true, '5451': true, '5460': true,   // bank invest/withdraw, cashier's check
+  '5850': true, '5851': true,                 // vault deposit/withdraw
+  '6010': true, '6011': true,                 // offshore bank deposit/withdraw
+  '6200': true, '6201': true                  // loan increase/decrease
+};
+
+/** Background tints for conditional formatting: gain / loss / flat. */
+var CF_COLORS = { pos: '#d9ead3', neg: '#f4cccc', neutral: '#eeeeee' };
 
 /**
  * Which LogTypeMap directions count as money moving. Anything else — item_loss,
@@ -138,4 +162,22 @@ function firstKey_(obj, keys) {
     if (obj[keys[i]] !== undefined && obj[keys[i]] !== null) return obj[keys[i]];
   }
   return null;
+}
+
+/**
+ * Green/red/neutral conditional-format rules for money cells, applied per cell
+ * so empty cells stay unstyled. Accepts one range or an array of ranges (used
+ * to cover several disjoint rows on the Dashboard). Re-applied on every rebuild
+ * because clear() wipes conditional formatting.
+ */
+function cfMoneyRules_(ranges) {
+  var arr = Array.isArray(ranges) ? ranges : [ranges];
+  return [
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(0).setBackground(CF_COLORS.pos).setRanges(arr).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberLessThan(0).setBackground(CF_COLORS.neg).setRanges(arr).build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberEqualTo(0).setBackground(CF_COLORS.neutral).setRanges(arr).build()
+  ];
 }

@@ -19,7 +19,8 @@ exports; the numeric prefixes only document the execution path.
 | `sync.gs` | `syncLogs` — the only writer to RawLog |
 | `parse.gs` | Money extraction from raw log JSON |
 | `rebuild.gs` | `rebuild` and the readers that feed it |
-| `dashboard.gs` | Income vs expenses summary |
+| `dashboard.gs` | Comprehensive summary (flows + networth + compare) |
+| `networth.gs` | Networth snapshots and the realized/unrealized compare |
 | `tools.gs` | Manual menu helpers for diagnosis |
 | `menu.gs` | `runAll`, trigger installation, `onOpen` |
 | `private.gs` | **Your API key (gitignored — see below)** |
@@ -53,7 +54,19 @@ Output, rewritten on every rebuild:
 - **Income** — date, title, bucket, amount for every money-in event.
 - **Expenses** — the same columns for every money-out event.
 - **Exceptions** — logs that could not be interpreted, with a hint on what to fix.
-- **Dashboard** — totals, net, and daily averages.
+- **Networth** — append-only snapshots of Torn's `/user/networth`, taken on every
+  sync and via Torn > 9. Snapshot networth. One row per recomputation (deduped on
+  Torn's own timestamp): total, wallet, vault, city/cayman bank, inventory,
+  bazaar, trades, item market, stocks, property, company, points.
+- **Compare** — per-snapshot `Δ networth`, split into **realized** (cash the
+  ledger actually saw — income minus expenses, mirroring rebuild's accounting
+  minus transfers) and **unrealized** (the rest: stock and item value changes,
+  looted value). Cumulative columns on each row; the last row is the all-time
+  total.
+- **Dashboard** — totals, net and daily averages, the latest networth snapshot,
+  the latest and all-time realized/unrealized split, and a status badge
+  (▲ profitable / ▼ losing). Money cells are color-coded by sign: green = gain,
+  red = loss, gray = flat.
 
 Archive:
 
@@ -76,6 +89,33 @@ Treat the result as a head start and confirm each type you care about — you ca
 flip any row to `ignore` to exclude it. `money_key` is only needed when a log's
 amount lives in a field `config.gs` does not already recognise — run Torn > 5.
 Inspect a log type to see the actual `data` keys.
+
+## Networth vs ledger
+
+These are two different questions:
+
+- **Ledger = flow.** `NET` is every dollar that came in minus every dollar that
+  went out, summed over your whole tracked history. It has no opening balance.
+- **Networth = stock.** What you own right now — cash, items, stocks, property.
+
+That's why `NET` never matches your wallet balance: the surplus went into assets
+(the ledger counts the cash out when you buy them and cash in when you sell; it
+never knows their current value). The Compare tab reconciles them per snapshot:
+
+    Δ networth = realized + unrealized
+
+where **realized** is the cash the ledger saw in the window and **unrealized** is
+value changes of what you hold (stock prices, item values). For the equation to
+balance, transfers that only move money between networth buckets — bank
+invest/withdraw, vault, offshore bank, loans (`TRANSFER_TYPES` in config.gs) —
+are excluded from realized; interest earned still counts as income. Company and
+bookie deposits are deliberately left out: networth's treatment of those balances
+is ambiguous, and they only shift the split, never the total.
+
+One timing note: Torn's networth carries its own compute timestamp, which can lag
+"now" by up to ~30 minutes. A snapshot window's realized/unrealized therefore
+covers activity up to that compute time — recent minutes show up in the *next*
+window, not a bug.
 
 ## Design rules
 
@@ -109,7 +149,8 @@ flight costs and a user ID as four million of rent.)
   and Torn's "too many requests" error is retried automatically after the window
   clears, so a backfill run survives traffic spikes. Fetched rows are written
   progressively, so even a run that hits the six-minute cap keeps its progress.
-- **One request per hour** via the trigger.
+- **One request per hour** via the trigger (plus one paced `/user/networth` call
+  per sync for the snapshot).
 
 ## Conventions
 

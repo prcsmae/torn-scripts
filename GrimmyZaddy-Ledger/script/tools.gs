@@ -65,6 +65,7 @@ function diagnoseSync() {
   }
   lines.push('Income rows: ' + rows_(TABS.INCOME));
   lines.push('Expenses rows: ' + rows_(TABS.EXPENSE));
+  lines.push('Networth snapshots: ' + rows_(TABS.NETWORTH));
   lines.push('');
 
   try {

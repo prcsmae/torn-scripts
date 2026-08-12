@@ -8,6 +8,10 @@
 function runAll() {
   var n = syncLogs();
   var x = rebuild();
+  // The views are cosmetic and idempotent — a transient sheet error here must
+  // not misreport a successful sync+rebuild as a failure.
+  try { buildCompare_(); } catch (e) { /* ignored */ }
+  try { buildDashboard_(); } catch (e) { /* ignored */ }
   return { added: n, exceptions: x };
 }
 
@@ -43,5 +47,6 @@ function onOpen() {
     .addItem('6. Refresh log-type reference', 'refreshReference')
     .addItem('7. Rebuild dashboard', 'rebuildDashboard')
     .addItem('8. Diagnose sync', 'diagnoseSync')
+    .addItem('9. Snapshot networth', 'snapshotNetworth')
     .addToUi();
 }

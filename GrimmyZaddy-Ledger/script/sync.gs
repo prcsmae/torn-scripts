@@ -182,5 +182,9 @@ function syncLogs() {
     throw e;
   }
 
+  // Best-effort networth snapshot (one paced request). A failure here must
+  // never fail the sync, so it is swallowed deliberately.
+  try { snapshotNetworth_(); } catch (e) { /* ignored */ }
+
   return added;
 }
