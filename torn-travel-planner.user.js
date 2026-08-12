@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Travel Planner
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Plan profitable travel routes using live abroad prices (YATA /api/v1/travel/export/) + Torn market values. Per-trip profit, budget allocation, suggested buy-list, active-window (short-haul) & sleep (long-haul) planning.
 // @author       motherBarker (and China)
 // @match        https://www.torn.com/travelagency.php*
@@ -22,7 +22,8 @@
     apiKey: "A0SxQ5FFORk9CNAs", // Minimal access is enough (items only)
     yataUrl: "https://yata.yt/api/v1/travel/export/", // public, no auth (no restock field)
     prombotUrl: "https://api.prombot.co.uk/api/travel", // public; provides nextRestock (ISO)
-    modelUrl: "https://raw.githubusercontent.com/russianrob/torn-foreign-restock/main/restock-model.json", // restock intervals/qtys
+    modelUrl:
+      "https://raw.githubusercontent.com/russianrob/torn-foreign-restock/main/restock-model.json", // restock intervals/qtys
     cacheDuration: 300000, // 5 min cache
     autoRefreshMs: 600000, // 10 min auto-refresh
     defaultNetPct: 97, // what you actually get from trading (95-97)
@@ -138,12 +139,8 @@
           : CONFIG.defaultBufferMin;
         state.sleepHours = Number(state.sleepHours) || CONFIG.defaultSleepHours;
         if (state.respectStock == null) state.respectStock = true;
-        state.stockWindow = Number.isFinite(state.stockWindow)
-          ? state.stockWindow
-          : -1;
-        state.nerveWasteLimit = Number.isFinite(state.nerveWasteLimit)
-          ? state.nerveWasteLimit
-          : 0;
+        state.stockWindow = Number.isFinite(state.stockWindow) ? state.stockWindow : -1;
+        state.nerveWasteLimit = Number.isFinite(state.nerveWasteLimit) ? state.nerveWasteLimit : 0;
         if (!state.restockConfidence) state.restockConfidence = "med";
       }
       // Default the active-window start to "now" if nothing is saved.
@@ -175,14 +172,21 @@
   let updateSeq = 0;
   let loading = false;
   let lastLoadAt = 0;
+  let _ttpNow = Date.now; // injectable clock (tests); matches foreignstock's __setClock
 
   function getCached(key) {
     const c = apiCache[key];
     return c && Date.now() - c.ts < CONFIG.cacheDuration ? c.data : null;
   }
-  function ttpInBackoff() { return Date.now() < _ttpBackoffUntil; }
-  function ttpApiOk() { _ttpBackoffUntil = 0; }
-  function ttpApiErr() { _ttpBackoffUntil = Date.now() + 300000; } // 5 min cooldown
+  function ttpInBackoff() {
+    return Date.now() < _ttpBackoffUntil;
+  }
+  function ttpApiOk() {
+    _ttpBackoffUntil = 0;
+  }
+  function ttpApiErr() {
+    _ttpBackoffUntil = Date.now() + 300000;
+  } // 5 min cooldown
 
   // ========== NETWORK ==========
   function gmFetch(url) {
@@ -263,7 +267,10 @@
     }
     try {
       const data = await gmFetch(url);
-      if (!data || data.error || data.nerve == null) { ttpApiErr(); return null; }
+      if (!data || data.error || data.nerve == null) {
+        ttpApiErr();
+        return null;
+      }
       apiCache[url] = { data: data, ts: Date.now() };
       ttpApiOk();
       return data;
@@ -294,7 +301,10 @@
     }
     try {
       const data = await gmFetch(url);
-      if (!data || !data.items) { ttpApiErr(); throw new Error("Torn: unexpected response"); }
+      if (!data || !data.items) {
+        ttpApiErr();
+        throw new Error("Torn: unexpected response");
+      }
       apiCache[url] = { data: data, ts: Date.now() };
       ttpApiOk();
       return data;
@@ -346,20 +356,33 @@
     return isNaN(t) ? null : t;
   }
   // Next restock time (ms): PromBot's nextRestock first, else estimate from the
-// restock model (last restock + next multiple of the interval).
-// A nextRestock already in the PAST means the export is stale (the shop hasn't
-// actually refilled yet) — ignore it rather than claim it'll be in stock.
-function itemNextRestockMs(s, entry, nowMs) {
+  // restock model (last restock + next multiple of the interval). Mirrors
+  // foreign-stock's nextRestockSec: the model is only trusted for non-low
+  // reliability (rel) entries, and the next slot is floored to a full interval
+  // so we never claim a restock is "right now" when it's actually uncertain.
+  // A nextRestock already in the PAST means the export is stale (the shop hasn't
+  // actually refilled yet) — ignore it rather than claim it'll be in stock.
+  function itemNextRestockMs(s, entry, nowMs) {
     if (s && s.nextRestock != null) {
       const m = toMs(s.nextRestock);
       if (m != null && m > nowMs) return m; // only future restocks are actionable
     }
-    if (entry && typeof entry.last === "number" && typeof entry.interval === "number") {
+    if (
+      entry &&
+      typeof entry.last === "number" &&
+      typeof entry.interval === "number" &&
+      (entry.rel || "low") !== "low"
+    ) {
       const last = entry.last * 1000;
       const interval = entry.interval * 1000;
       if (last > nowMs) return last;
-      const n = Math.ceil((nowMs - last) / interval);
-      return last + n * interval;
+      // since < 0 is handled above; otherwise the next slot is a whole number of
+      // intervals after the last observed restock — never "now" itself, so a
+      // bumpy estimate can't pretend the shop just refilled.
+      const since = nowMs - last;
+      let left = interval - (since % interval);
+      if (left <= 0) left = interval; // min 1 full interval
+      return nowMs + left;
     }
     return null;
   }
@@ -370,8 +393,7 @@ function itemNextRestockMs(s, entry, nowMs) {
       const med = a.length % 2 ? a[m] : Math.round((a[m - 1] + a[m]) / 2);
       if (med > 0) return med;
     }
-    if (typeof (entry && entry.modelQty) === "number" && entry.modelQty > 0)
-      return entry.modelQty;
+    if (typeof (entry && entry.modelQty) === "number" && entry.modelQty > 0) return entry.modelQty;
     return null;
   }
   function confRank(c) {
@@ -390,19 +412,17 @@ function itemNextRestockMs(s, entry, nowMs) {
       if (level === "med") level = "low";
       else if (level === "high" && !(s && s.nextRestock != null)) level = "med";
     }
-    return { level, label: level === "high" ? "high" : level === "med" ? "medium" : "low" };
+    return {
+      level,
+      label: level === "high" ? "high" : level === "med" ? "medium" : "low",
+    };
   }
   const RESTOCK_CUSHION_MIN = 3; // minutes of safety on top of stockWindow, so a bumpy restock estimate still shelves before you land
   // Predicted minutes until an in-stock item sells out, from the model's sellRate
   // (mirrors foreign-stock: buffered so we err toward 'sells out sooner').
   const SELL_SAFETY = 1.15;
   function depletionInfo(qty, entry) {
-    if (
-      qty > 0 &&
-      entry &&
-      typeof entry.sellRate === "number" &&
-      isFinite(entry.sellRate)
-    ) {
+    if (qty > 0 && entry && typeof entry.sellRate === "number" && isFinite(entry.sellRate)) {
       const rate = entry.sellRate * SELL_SAFETY;
       if (rate > 0) return { depletesMin: qty / rate };
     }
@@ -487,7 +507,7 @@ function itemNextRestockMs(s, entry, nowMs) {
                   Math.max(1, Math.round((nrMs - arrivalMs) / 60000)) +
                   "m after you land — wait",
                 restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
-                beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+                beforeLanding: Math.round((arrivalMs - nrMs) / 60000), // negative = after you land
                 conf,
               };
             }
@@ -504,12 +524,23 @@ function itemNextRestockMs(s, entry, nowMs) {
           qty,
           note: "in stock",
           conf,
-          depletion: { sellsOutBeforeLand: true, beforeLanding: Math.max(1, Math.round(-beforeLand)) },
+          depletion: {
+            sellsOutBeforeLand: true,
+            beforeLanding: Math.max(1, Math.round(-beforeLand)),
+          },
         };
+      }
+      // Quantity still on the shelf when you land: current stock minus what the
+      // buffered sell rate eats during the flight (mirrors restockSurvival).
+      // Without a sell rate, assume the full current stock is still buyable.
+      let qtyAtLanding = qty;
+      if (dep) {
+        const bufferedRate = qty / dep.depletesMin; // = sellRate * SELL_SAFETY
+        qtyAtLanding = Math.max(1, Math.floor(qty - bufferedRate * flightMin));
       }
       return {
         status: "instock",
-        qty,
+        qty: qtyAtLanding,
         note: "in stock",
         conf,
         depletion: {
@@ -525,7 +556,10 @@ function itemNextRestockMs(s, entry, nowMs) {
     }
     const nrMs = itemNextRestockMs(s, entry, nowMs);
     const byMs = arrivalMs + (stockWindowMin || 0) * 60000 - RESTOCK_CUSHION_MIN * 60000;
-    if (nrMs != null && nrMs <= byMs) {
+    // Only claim "restocked before you land" when the restock truly precedes
+    // arrival; a positive stockWindow can push byMs past arrival, and restocks
+    // after landing belong to the post-arrival wait path below.
+    if (nrMs != null && nrMs <= byMs && nrMs <= arrivalMs) {
       const survived = restockSurvival(
         modelRestockQty(entry) || state.capacity * 3,
         entry && entry.sellRate,
@@ -569,7 +603,7 @@ function itemNextRestockMs(s, entry, nowMs) {
             Math.max(1, Math.round((nrMs - arrivalMs) / 60000)) +
             "m after you land — wait",
           restockIn: Math.max(0, Math.round((nrMs - nowMs) / 60000)),
-          beforeLanding: Math.max(0, Math.round((arrivalMs - nrMs) / 60000)),
+          beforeLanding: Math.round((arrivalMs - nrMs) / 60000), // negative = after you land
           conf,
         };
       }
@@ -580,15 +614,21 @@ function itemNextRestockMs(s, entry, nowMs) {
   function nerveInfo(roundTripMin, nerve) {
     const max = (nerve && nerve.nerve_maximum) || 100;
     const nowPts = nerve && typeof nerve.nerve === "number" ? nerve.nerve : null;
-    const base = { max, now: nowPts, msPerNerve: null, regen: 0, waste: 0, spendTo: null };
+    const base = {
+      max,
+      now: nowPts,
+      msPerNerve: null,
+      regen: 0,
+      waste: 0,
+      spendTo: null,
+    };
     if (nerve == null || nowPts == null) return base;
     let msPerNerve = null;
     if (nowPts < max && nerve.nerve_fulltime) {
       const fullMs = nerve.nerve_fulltime * 1000;
       if (fullMs > Date.now()) msPerNerve = (fullMs - Date.now()) / (max - nowPts);
     }
-    if (msPerNerve == null || !isFinite(msPerNerve) || msPerNerve <= 0)
-      msPerNerve = 5 * 60000; // default: 1 nerve / 5 min
+    if (msPerNerve == null || !isFinite(msPerNerve) || msPerNerve <= 0) msPerNerve = 5 * 60000; // default: 1 nerve / 5 min
     const regen = Math.floor((roundTripMin * 60000) / msPerNerve);
     const waste = Math.max(0, regen - (max - nowPts));
     return {
@@ -610,7 +650,7 @@ function itemNextRestockMs(s, entry, nowMs) {
     const netPct = state.netPct / 100;
     const buffer = state.bufferMin; // buy-time buffer (all flights)
     const windowMin = windowMinutes();
-    const nowMs = Date.now();
+    const nowMs = _ttpNow();
     const rows = [];
 
     for (const key of Object.keys(CONFIG.destinations)) {
@@ -739,7 +779,7 @@ function itemNextRestockMs(s, entry, nowMs) {
     const cap = state.capacity;
     const netPct = state.netPct / 100;
     const sleepMin = state.sleepHours * 60;
-    const nowMs = Date.now();
+    const nowMs = _ttpNow();
     const rows = [];
 
     for (const key of Object.keys(CONFIG.destinations)) {
@@ -783,37 +823,50 @@ function itemNextRestockMs(s, entry, nowMs) {
           if (q > 0) {
             availNow = q;
             noteNow =
-              ld.beforeLanding != null
+              ld.beforeLanding != null && ld.beforeLanding > 0
                 ? "restocks ~" + ld.beforeLanding + "m before you land"
-                : "restocked before you land";
+                : ld.note || "restocked before you land";
           }
         }
         if (availNow > 0)
-          nowCands.push({ id: s.id, name: it.name || "#" + s.id, avail: availNow, cost: s.cost, received, unitNet, note: noteNow });
+          nowCands.push({
+            id: s.id,
+            name: it.name || "#" + s.id,
+            avail: availNow,
+            cost: s.cost,
+            received,
+            unitNet,
+            note: noteNow,
+          });
 
         // --- Scenario "timed": land ~R + window + cushion after the restock ---
         if (R) {
-          const restockInMin = (R - nowMs) / 60000;
-          const landDelayMin = restockInMin + RESTOCK_CUSHION_MIN - (state.stockWindow || 0);
-          const departureMin = landDelayMin - oneWay;
-          if (departureMin >= 0) {
-            const arrivalMin = departureMin + oneWay;
-            const qtyAtRestock = modelRestockQty(entry) || qtyNow || cap * 3;
-            const q = restockSurvival(qtyAtRestock, rate, nowMs + arrivalMin * 60000, R);
-            if (q > 0)
-              timedCands.push({
-                id: s.id,
-                name: it.name || "#" + s.id,
-                avail: q,
-                cost: s.cost,
-                received,
-                unitNet,
-                departureMin: Math.round(departureMin),
-                arrivalMin: Math.round(arrivalMin),
-                afterRestockMin: Math.max(1, Math.round(arrivalMin - restockInMin)),
-                conf: restockConfidence(s, entry),
-                note: "",
-              });
+          const conf = restockConfidence(s, entry);
+          // Same confidence gate as the main planner: never time a departure
+          // to a restock estimate we wouldn't trust out-of-stock.
+          if (confRank(state.restockConfidence || "med") <= confRank(conf.level)) {
+            const restockInMin = (R - nowMs) / 60000;
+            const landDelayMin = restockInMin + RESTOCK_CUSHION_MIN - (state.stockWindow || 0);
+            const departureMin = landDelayMin - oneWay;
+            if (departureMin >= 0) {
+              const arrivalMin = departureMin + oneWay;
+              const qtyAtRestock = modelRestockQty(entry) || qtyNow || cap * 3;
+              const q = restockSurvival(qtyAtRestock, rate, nowMs + arrivalMin * 60000, R);
+              if (q > 0)
+                timedCands.push({
+                  id: s.id,
+                  name: it.name || "#" + s.id,
+                  avail: q,
+                  cost: s.cost,
+                  received,
+                  unitNet,
+                  departureMin: Math.round(departureMin),
+                  arrivalMin: Math.round(arrivalMin),
+                  afterRestockMin: Math.max(1, Math.round(arrivalMin - restockInMin)),
+                  conf,
+                  note: "",
+                });
+            }
           }
         }
       }
@@ -871,11 +924,7 @@ function itemNextRestockMs(s, entry, nowMs) {
         if (!sc || !sc.buyList.length) continue;
         const fits = kind === "timed" ? timedFits : nowFits;
         const profitNet = sc.tripProfit - travelCost;
-        if (
-          !best ||
-          (fits && !best.fits) ||
-          (fits === best.fits && profitNet > best.profitNet)
-        ) {
+        if (!best || (fits && !best.fits) || (fits === best.fits && profitNet > best.profitNet)) {
           best = { ...sc, profitNet, travelCost, fits };
           bestKind = kind;
         }
@@ -944,8 +993,9 @@ function itemNextRestockMs(s, entry, nowMs) {
       const before = ld.beforeLanding != null ? ld.beforeLanding : "?";
       const inMin = ld.restockIn != null ? ld.restockIn : "?";
       const conf = ld.conf ? ld.conf.label : "";
-      // Post-arrival restock: beforeLanding is negative; use the note instead.
-      if (typeof before === "number" && before < 0) {
+      // Post-arrival restock: beforeLanding is negative (or 0 when the
+      // restock coincides with landing); use the note instead.
+      if (typeof before === "number" && before <= 0) {
         return `<span style="color:#c9a227;font-size:10px;" title="Restocks in ~${inMin}m from now (~${-before}m after you land) — confidence: ${conf}">🟡 ${ld.note || "restocks shortly after you land"}${conf ? " · " + conf : ""}</span>`;
       }
       return `<span style="color:#c9a227;font-size:10px;" title="Restocks in ~${inMin}m from now (~${before}m before you land) — confidence: ${conf}">🟡 restocks ~${before}m before you land${conf ? " · " + conf : ""}</span>`;
@@ -1013,7 +1063,12 @@ function itemNextRestockMs(s, entry, nowMs) {
       const c = sleep.chosen;
       const top =
         c.top && c.top.length
-          ? c.top.map((t) => `${t.name} ×${t.qty}${t.after != null ? ` (${t.after}m after restock)` : ""}`).join(", ")
+          ? c.top
+              .map(
+                (t) =>
+                  `${t.name} ×${t.qty}${t.after != null ? ` (${t.after}m after restock)` : ""}`,
+              )
+              .join(", ")
           : "—";
       const timedPick = c.kind === "timed" && c.buyList[0] && c.buyList[0].dep != null;
       const depItem = timedPick ? c.buyList[0] : null;
@@ -1139,11 +1194,7 @@ function itemNextRestockMs(s, entry, nowMs) {
         statusEl.innerHTML = '<span style="color:#dc3545;">Error: ' + (e.message || e) + "</span>";
       return;
     }
-    const sleep = sleepRecommendation(
-      lastData.abroad,
-      lastData.items,
-      lastData.model || {},
-    );
+    const sleep = sleepRecommendation(lastData.abroad, lastData.items, lastData.model || {});
     buildSummary(computed, sleep, lastData.nerve);
     buildTable(computed);
     updateStatus();
@@ -1166,11 +1217,7 @@ function itemNextRestockMs(s, entry, nowMs) {
     statusEl.innerHTML = `Data ${age >= 0 ? age + "s old" : "—"} · ${mode}`;
     let suff = state.respectStock ? " · stock@arrival" : "";
     if (lastData && lastData.nerve)
-      suff +=
-        " · nerve " +
-        lastData.nerve.nerve +
-        "/" +
-        (lastData.nerve.nerve_maximum || 100);
+      suff += " · nerve " + lastData.nerve.nerve + "/" + (lastData.nerve.nerve_maximum || 100);
     if (suff) statusEl.innerHTML += suff;
   }
 
@@ -1200,7 +1247,13 @@ function itemNextRestockMs(s, entry, nowMs) {
       if (seq !== updateSeq) return;
       const itemMap = {};
       for (const [id, it] of Object.entries(items.items || {})) itemMap[parseInt(id)] = it;
-      lastData = { abroad, items: itemMap, model, nerve, fetchedAt: Date.now() };
+      lastData = {
+        abroad,
+        items: itemMap,
+        model,
+        nerve,
+        fetchedAt: Date.now(),
+      };
       renderResults();
     } catch (e) {
       if (seq !== updateSeq) return;
@@ -1663,9 +1716,41 @@ function itemNextRestockMs(s, entry, nowMs) {
     log("Travel Planner ready.");
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
-  } else {
-    init();
+  // Headless/Node guard: keeps require() side-effect free (no live DOM) so the
+  // pure helpers below can be unit-tested with a small harness (see the
+  // torn-userscripts skill). Identical behavior in the browser.
+  if (typeof document !== "undefined" && typeof document.getElementById === "function") {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", init);
+    } else {
+      init();
+    }
+  }
+
+  // ========== TESTS (module.exports) ==========
+  // Pure helpers exported for the Node verification harness. In the browser
+  // `module` is undefined so this block is inert.
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+      CONFIG,
+      state,
+      toMs,
+      itemNextRestockMs,
+      modelRestockQty,
+      confRank,
+      restockConfidence,
+      depletionInfo,
+      restockSurvival,
+      landingAvailability,
+      nerveInfo,
+      computeDestinations,
+      computeSleepPlan,
+      RESTOCK_CUSHION_MIN,
+      POST_ARRIVAL_MINS,
+      SELL_SAFETY,
+    };
+    module.exports.__setClock = function (fn) {
+      _ttpNow = fn || Date.now;
+    };
   }
 })();
