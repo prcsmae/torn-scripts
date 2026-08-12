@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Travel Planner
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Plan profitable travel routes using live abroad prices (YATA /api/v1/travel/export/) + Torn market values. Per-trip profit, budget allocation, suggested buy-list, active-window (short-haul) & sleep (long-haul) planning.
 // @author       motherBarker (and China)
 // @match        https://www.torn.com/travelagency.php*
@@ -459,8 +459,14 @@
       const dep = depletionInfo(qty, entry);
       const flightMin = (arrivalMs - nowMs) / 60000;
       const beforeLand = dep ? dep.depletesMin - flightMin : null; // + = after landing, - = before
-      if (beforeLand != null && beforeLand < 0) {
-        // In stock now, but likely sold out before you land.
+      // Stock must still be on the shelf when you finish buying on the ground
+      // (buy buffer + stock window). Items that sell out before that are only
+      // useful if a restock lands in time. Only positive stock windows extend
+      // the requirement — the default -1 means "land right after a restock"
+      // (short window), which never shortens the plain buy-buffer time.
+      const minSurviveMin = state.bufferMin + Math.max(0, stockWindowMin || 0);
+      if (beforeLand != null && beforeLand < minSurviveMin) {
+        // In stock now, but likely sold out before you finish buying.
         if (state.respectStock) {
           const nrMs = itemNextRestockMs(s, entry, nowMs);
           if (nrMs != null && nrMs <= arrivalMs) {
@@ -512,10 +518,14 @@
               };
             }
           }
+          const soon = beforeLand < 0;
+          const soonMin = Math.max(1, Math.round(soon ? -beforeLand : beforeLand));
           return {
             status: "empty",
             qty: 0,
-            note: "depletes ~" + Math.max(1, Math.round(-beforeLand)) + "m before you land",
+            note: soon
+              ? "depletes ~" + soonMin + "m before you land"
+              : "sells out ~" + soonMin + "m after you land — not enough time to buy",
             conf,
           };
         }
@@ -525,14 +535,15 @@
           note: "in stock",
           conf,
           depletion: {
-            sellsOutBeforeLand: true,
-            beforeLanding: Math.max(1, Math.round(-beforeLand)),
+            sellsOutBeforeLand: beforeLand < 0,
+            beforeLanding: Math.max(1, Math.round(beforeLand < 0 ? -beforeLand : beforeLand)),
           },
         };
       }
-      // Quantity still on the shelf when you land: current stock minus what the
-      // buffered sell rate eats during the flight (mirrors restockSurvival).
-      // Without a sell rate, assume the full current stock is still buyable.
+      // Survives through the buying window — plainly buyable. Quantity still on
+      // the shelf when you land: current stock minus what the buffered sell
+      // rate eats during the flight (mirrors restockSurvival). Without a sell
+      // rate, assume the full current stock is still buyable.
       let qtyAtLanding = qty;
       if (dep) {
         const bufferedRate = qty / dep.depletesMin; // = sellRate * SELL_SAFETY
@@ -545,7 +556,7 @@
         conf,
         depletion: {
           depletesMin: dep ? Math.round(dep.depletesMin) : null,
-          beforeLanding: beforeLand != null ? Math.max(1, Math.round(beforeLand)) : null,
+          beforeLanding: null, // plain "in stock" — no sells-out noise
         },
       };
     }
