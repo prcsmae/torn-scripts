@@ -12,6 +12,11 @@
  *      successive runs with a BACKFILL_TO cursor until every category's true
  *      beginning is reached. This is how a fresh ledger gets its history.
  *
+ * Fetched rows are flushed to the sheet incrementally, so even a run that dies
+ * on a rate limit or transient error keeps the rows it already pulled (and the
+ * watermarks advance to match). fetchJson_ paces calls and retries Torn's
+ * error 5 itself.
+ *
  * The request is filtered to MONEY_CATS (14 "Money outgoing", 17 "Money incoming",
  * 138 "Vault", 145 "Offshore bank") so every income, expense and transfer entry
  * is captured. The `cat` parameter accepts exactly one category id, so each
@@ -44,7 +49,9 @@ function syncLogs() {
     from = 0;
   }
 
-  var rows = [], maxTs = from, runMin = Infinity;
+  var rows = [], maxTs = from, runMin = Infinity, added = 0;
+  var moreHistory = false, backfillFloor = 0, capped = false;
+  var freshRun = minStored === Infinity;   // started with an empty RawLog
   var MAX_PAGES = 20;               // 2,000 entries per category per pass
 
   function consume(log) {
@@ -87,65 +94,93 @@ function syncLogs() {
     return { oldest: oldest, newInPage: newInPage };
   }
 
-  // ---- Pass 1: incremental, newest first --------------------------------
-  var capped = false;               // history deeper than this run's window
-  MONEY_CATS.forEach(function (cat) {
-    var cursorTo = 0;
-    for (var page = 0; page < MAX_PAGES; page++) {
-      // from = watermark - 1: the docs say from is exclusive (\"after this time\")
-      // but the live API is inclusive, so the watermark second must be re-fetched
-      // under either behavior. Dedupe makes the overlap harmless.
-      var url = API + '/user/log?key=' + key_() + '&cat=' + cat
-              + (from && page === 0 ? '&from=' + (from - 1) : '')
-              + (cursorTo ? '&to=' + cursorTo : '')
-              + '&limit=100';
-      var log = fetchJson_(url).log || [];
-      if (!log.length) break;
-      var r = consume(log);
-      if (log.length < 100) break;  // that was the last page
-      if (!r.newInPage) break;      // nothing new — already have this stretch
-      if (r.oldest <= from) break;  // reached the watermark
-      if (page === MAX_PAGES - 1) { capped = true; break; }  // more history below
-      cursorTo = r.oldest;          // step further back, dedupe handles the overlap
-      Utilities.sleep(700);         // stay comfortably under 100 requests/minute
-    }
-  });
-
-  // ---- Pass 2: backfill older history below the oldest stored entry ------
-  // BACKFILL_TO is the oldest timestamp fetched so far; each run fetches the
-  // window just below it and advances the cursor. Deleted once every category
-  // has no entries left (a short or empty page means that category is done).
-  var backfillTo = Number(props.getProperty('BACKFILL_TO') || 0);
-  if (!backfillTo && capped) {
-    var floor = Math.min(minStored, runMin);
-    backfillTo = isFinite(floor) ? floor : 0;
+  // Persist whatever has been fetched so far. Called after each pass and on any
+  // failure — a partial run must keep its progress, never throw it away.
+  // advance: also move the LAST_TS watermark. Only safe when the full pass-1
+  // walk completed (every category processed): advancing it on a partial run
+  // would skip entries of categories that were never walked, and the backfill
+  // pass cannot reach them (it only walks below its cursor), so they'd be lost
+  // forever.
+  function flush(advance) {
+    if (!rows.length) return;
+    rows.sort(function (a, b) { return a[0] - b[0]; });
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+    if (advance) props.setProperty('LAST_TS', String(maxTs));
+    added += rows.length;
+    rows = [];
   }
 
-  var moreHistory = false, backfillFloor = backfillTo;
-  if (backfillTo > 0) {
+  try {
+    // ---- Pass 1: incremental, newest first ------------------------------
+    // capped: history deeper than this run's window remains unfetched.
     MONEY_CATS.forEach(function (cat) {
-      var cursor = backfillTo;
+      var cursorTo = 0;
       for (var page = 0; page < MAX_PAGES; page++) {
+        // from = watermark - 1: the docs say from is exclusive (\"after this time\")
+        // but the live API is inclusive, so the watermark second must be re-fetched
+        // under either behavior. Dedupe makes the overlap harmless.
         var url = API + '/user/log?key=' + key_() + '&cat=' + cat
-                + '&to=' + cursor + '&limit=100';
+                + (from && page === 0 ? '&from=' + (from - 1) : '')
+                + (cursorTo ? '&to=' + cursorTo : '')
+                + '&limit=100';
         var log = fetchJson_(url).log || [];
         if (!log.length) break;
         var r = consume(log);
-        if (r.oldest < backfillFloor) backfillFloor = r.oldest;
-        if (log.length === 100) moreHistory = true;
-        if (log.length < 100) break;      // this category's history is exhausted
-        cursor = r.oldest;                // keep walking further back
-        Utilities.sleep(700);
+        if (log.length < 100) break;   // that was the last page
+        if (!r.newInPage) break;       // nothing new — already have this stretch
+        if (r.oldest <= from) break;   // reached the watermark
+        if (page === MAX_PAGES - 1) { capped = true; break; }  // more history below
+        cursorTo = r.oldest;           // step further back, dedupe handles the overlap
       }
     });
-    if (moreHistory) props.setProperty('BACKFILL_TO', String(backfillFloor));
-    else props.deleteProperty('BACKFILL_TO');
+    flush(true);  // full pass-1 walk — the watermark is the true global newest
+
+    // ---- Pass 2: backfill older history below the oldest stored entry ------
+    // BACKFILL_TO is the oldest timestamp fetched so far; each run fetches the
+    // window just below it and advances the cursor. Deleted once every category
+    // has no entries left (a short or empty page means that category is done).
+    var backfillTo = Number(props.getProperty('BACKFILL_TO') || 0);
+    if (!backfillTo && capped) {
+      var floor = Math.min(minStored, runMin);
+      backfillTo = isFinite(floor) ? floor : 0;
+    }
+    moreHistory = false;
+    backfillFloor = backfillTo;
+
+    if (backfillTo > 0) {
+      MONEY_CATS.forEach(function (cat) {
+        var cursor = backfillTo;
+        for (var page = 0; page < MAX_PAGES; page++) {
+          var url = API + '/user/log?key=' + key_() + '&cat=' + cat
+                  + '&to=' + cursor + '&limit=100';
+          var log = fetchJson_(url).log || [];
+          if (!log.length) break;
+          var r = consume(log);
+          if (r.oldest < backfillFloor) backfillFloor = r.oldest;
+          if (log.length === 100) moreHistory = true;
+          if (log.length < 100) break;     // this category's history is exhausted
+          cursor = r.oldest;               // keep walking further back
+        }
+      });
+      if (moreHistory) props.setProperty('BACKFILL_TO', String(backfillFloor));
+      else props.deleteProperty('BACKFILL_TO');
+    }
+    flush(true);  // pass 1 already advanced the watermark correctly
+  } catch (e) {
+    // A hard failure (e.g. the six-minute cap) must not lose what was fetched,
+    // and must not strand the history below it: if a fresh run or a truncated
+    // walk ended without reaching the true beginning, remember the deepest
+    // fetched timestamp so the next run continues the backfill there. The
+    // watermark is NOT advanced: on a mid-pass-1 failure that would skip
+    // categories never walked (and backfill can't reach above its cursor).
+    flush(false);
+    var floor = Math.min(minStored, runMin);
+    var f = backfillFloor > 0 ? backfillFloor : (isFinite(floor) ? floor : 0);
+    if ((freshRun || capped || moreHistory) && f > 0) {
+      props.setProperty('BACKFILL_TO', String(f));
+    }
+    throw e;
   }
 
-  if (rows.length) {
-    rows.sort(function (a, b) { return a[0] - b[0]; });
-    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
-    props.setProperty('LAST_TS', String(maxTs));
-  }
-  return rows.length;
+  return added;
 }

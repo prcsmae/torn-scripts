@@ -105,7 +105,11 @@ flight costs and a user ID as four million of rent.)
 - **No item reference.** Setup skips Torn's tens-of-thousands-row items list —
   this ledger only needs the money amount and title, which every log carries.
 - **Batched sheet I/O** — read a range once, build an array, write once.
-- **One request per hour** via the trigger (100/minute is the API limit).
+- **Rate-limit safe.** Every API call is paced to ~60/minute (the limit is 100)
+  and Torn's "too many requests" error is retried automatically after the window
+  clears, so a backfill run survives traffic spikes. Fetched rows are written
+  progressively, so even a run that hits the six-minute cap keeps its progress.
+- **One request per hour** via the trigger.
 
 ## Conventions
 

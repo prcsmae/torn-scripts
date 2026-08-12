@@ -72,13 +72,33 @@ function key_() {
   return k;
 }
 
+// Pace every API call to at most one per second (60/min, comfortably under
+// Torn's 100/min limit). A backfill run makes hundreds of calls; without this
+// the category boundaries burst and Torn answers with error 5.
+var _lastFetchMs = 0;
+
 function fetchJson_(url) {
-  var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  var json = JSON.parse(res.getContentText());
-  if (json.error) {
-    throw new Error('Torn API error ' + json.error.code + ': ' + json.error.error);
+  var gap = 1000 - (Date.now() - _lastFetchMs);
+  if (gap > 0) Utilities.sleep(gap);
+  _lastFetchMs = Date.now();
+
+  // Rate limit (error 5) is transient: wait out the window and retry instead of
+  // aborting the run. Any other error still throws immediately.
+  var tries = 0;
+  while (true) {
+    var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    var json = JSON.parse(res.getContentText());
+    if (json.error) {
+      if (json.error.code === 5 && tries < 3) {
+        tries++;
+        Utilities.sleep(60000);
+        _lastFetchMs = Date.now();   // resume pacing from the retry, not the stale failed call
+        continue;
+      }
+      throw new Error('Torn API error ' + json.error.code + ': ' + json.error.error);
+    }
+    return json;
   }
-  return json;
 }
 
 function ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }
