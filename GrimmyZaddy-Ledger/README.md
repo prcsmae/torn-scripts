@@ -20,7 +20,7 @@ exports; the numeric prefixes only document the execution path.
 | `parse.gs` | Money extraction from raw log JSON |
 | `rebuild.gs` | `rebuild` and the readers that feed it |
 | `dashboard.gs` | Comprehensive summary (flows + networth + compare) |
-| `networth.gs` | Networth snapshots and the realized/unrealized compare |
+| `networth.gs` | Networth snapshots, realized/unrealized compare, faction vault |
 | `tools.gs` | Manual menu helpers for diagnosis |
 | `menu.gs` | `runAll`, trigger installation, `onOpen` |
 | `private.gs` | **Your API key (gitignored — see below)** |
@@ -58,6 +58,10 @@ Output, rewritten on every rebuild:
   sync and via Torn > 9. Snapshot networth. One row per recomputation (deduped on
   Torn's own timestamp): total, wallet, vault, city/cayman bank, inventory,
   bazaar, trades, item market, stocks, property, company, points.
+- **FactionVault** — append-only snapshots of your personal faction vault
+  balance (`[ts, date, balance, source]`). Recorded manually via Torn > 10.
+  Snapshot faction vault (enter what you see on Faction > Vault), and auto-fetched
+  from `/faction/{id}/balance` whenever the key has Faction API Access.
 - **Compare** — per-snapshot `Δ networth`, split into **realized** (cash the
   ledger actually saw — income minus expenses, mirroring rebuild's accounting
   minus transfers) and **unrealized** (the rest: stock and item value changes,
@@ -116,6 +120,24 @@ One timing note: Torn's networth carries its own compute timestamp, which can la
 "now" by up to ~30 minutes. A snapshot window's realized/unrealized therefore
 covers activity up to that compute time — recent minutes show up in the *next*
 window, not a bug.
+
+## Faction vault
+
+The faction vault is **not** part of Torn's networth total, so it is tracked
+separately (the Dashboard shows it right below the networth breakdown). Torn's
+API only exposes vault balances via `/faction/{id}/balance`, which requires the
+key's user to have **Faction API Access** granted by the faction leader
+(Faction > Controls > Positions > Permissions). Until then the endpoint answers
+error 16/7 and the tracker stays manual:
+
+1. Open Faction > Vault and read your balance.
+2. Torn > 10. Snapshot faction vault, paste the number (commas/`$` are fine).
+
+Each entry lands on the **FactionVault** tab; the Dashboard shows the latest
+balance and its change. If your faction later grants API access, snapshots are
+taken automatically on every sync (`source` column shows `api` vs `manual`). The
+ledger's income/expense rows already capture vault deposits and withdrawals as
+normal money flows.
 
 ## Design rules
 

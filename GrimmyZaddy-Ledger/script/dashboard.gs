@@ -31,42 +31,44 @@ function buildDashboard_() {
     ['Bazaar', '=IFERROR(INDEX(Networth!I2:I,COUNTA(Networth!I2:I)),0)'],            // row 13
     ['Stock market', '=IFERROR(INDEX(Networth!O2:O,COUNTA(Networth!O2:O)),0)'],      // row 14
     ['Property', '=IFERROR(INDEX(Networth!P2:P,COUNTA(Networth!P2:P)),0)'],          // row 15
-    ['', ''],                                                                        // row 16
-    ['SINCE PREVIOUS SNAPSHOT', ''],                                                 // row 17
-    ['Δ Networth', '=IFERROR(INDEX(Compare!C2:C,COUNTA(Compare!C2:C)),0)'],          // row 18
-    ['Realized (cash in/out)', '=IFERROR(INDEX(Compare!D2:D,COUNTA(Compare!D2:D)),0)'], // row 19
-    ['Unrealized (value change)', '=IFERROR(INDEX(Compare!E2:E,COUNTA(Compare!E2:E)),0)'], // row 20
-    ['', ''],                                                                        // row 21
-    ['ALL-TIME SINCE FIRST SNAPSHOT', ''],                                           // row 22
-    ['Δ Networth', '=IFERROR(INDEX(Compare!B2:B,COUNTA(Compare!B2:B))-INDEX(Compare!B2:B,1),0)'], // row 23
-    ['Realized (cash)', '=IFERROR(SUM(Compare!D2:D),0)'],                            // row 24
-    ['Unrealized (value)', '=IFERROR(SUM(Compare!E2:E),0)'],                         // row 25
-    ['', ''],                                                                        // row 26
-    ['DAILY RATES', ''],                                                             // row 27
-    ['Days tracked', '=IFERROR(ROUND((MAX(RawLog!A:A)-MIN(RawLog!A:A))/86400,1),0)'], // row 28
-    ['Avg daily income', '=IFERROR(B2/B28,0)'],                                      // row 29
-    ['Avg daily expense', '=IFERROR(B3/B28,0)'],                                     // row 30
-    ['Avg daily net', '=IFERROR(B4/B28,0)']                                          // row 31
+    ['Faction vault', '=IFERROR(INDEX(FactionVault!C2:C,COUNTA(FactionVault!C2:C)),0)'], // row 16
+    ['Δ Faction vault', '=IFERROR(INDEX(FactionVault!C2:C,COUNTA(FactionVault!C2:C))-INDEX(FactionVault!C2:C,COUNTA(FactionVault!C2:C)-1),0)'], // row 17
+    ['', ''],                                                                        // row 18
+    ['SINCE PREVIOUS SNAPSHOT', ''],                                                 // row 19
+    ['Δ Networth', '=IFERROR(INDEX(Compare!C2:C,COUNTA(Compare!C2:C)),0)'],          // row 20
+    ['Realized (cash in/out)', '=IFERROR(INDEX(Compare!D2:D,COUNTA(Compare!D2:D)),0)'], // row 21
+    ['Unrealized (value change)', '=IFERROR(INDEX(Compare!E2:E,COUNTA(Compare!E2:E)),0)'], // row 22
+    ['', ''],                                                                        // row 23
+    ['ALL-TIME SINCE FIRST SNAPSHOT', ''],                                           // row 24
+    ['Δ Networth', '=IFERROR(INDEX(Compare!B2:B,COUNTA(Compare!B2:B))-INDEX(Compare!B2:B,1),0)'], // row 25
+    ['Realized (cash)', '=IFERROR(SUM(Compare!D2:D),0)'],                            // row 26
+    ['Unrealized (value)', '=IFERROR(SUM(Compare!E2:E),0)'],                         // row 27
+    ['', ''],                                                                        // row 28
+    ['DAILY RATES', ''],                                                             // row 29
+    ['Days tracked', '=IFERROR(ROUND((MAX(RawLog!A:A)-MIN(RawLog!A:A))/86400,1),0)'], // row 30
+    ['Avg daily income', '=IFERROR(B2/B30,0)'],                                      // row 31
+    ['Avg daily expense', '=IFERROR(B3/B30,0)'],                                     // row 32
+    ['Avg daily net', '=IFERROR(B4/B30,0)']                                          // row 33
   ];
 
   d.getRange(1, 1, rows.length, 2).setValues(rows);
 
   // Section titles: bold on a tinted bar.
-  [1, 7, 17, 22, 27].forEach(function (r) {
+  [1, 7, 19, 24, 29].forEach(function (r) {
     d.getRange(r, 1).setFontWeight('bold').setBackground('#cfe2f3');
   });
   d.getRange(1, 1).setFontSize(14);
-  d.getRange('A1:A31').setFontWeight('bold');
+  d.getRange('A1:A33').setFontWeight('bold');
 
   // Money cells get a currency format.
-  [2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 23, 24, 25, 29, 30, 31]
+  [2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 25, 26, 27, 31, 32, 33]
     .forEach(function (r) { d.getRange(r, 2).setNumberFormat('$#,##0'); });
 
   d.setColumnWidth(1, 240);
   d.setColumnWidth(2, 200);
 
   // Color coding by status: gains green, losses red, zero flat.
-  var moneyRanges = [4, 18, 19, 20, 23, 24, 25, 31]
+  var moneyRanges = [4, 17, 20, 21, 22, 25, 26, 27, 33]
     .map(function (r) { return d.getRange(r, 2); });
   d.getRange(4, 2).setConditionalFormatRules(cfMoneyRules_(moneyRanges));
 

@@ -30,6 +30,10 @@ var COMPARE_HEADERS = ['date', 'networth', 'delta', 'realized', 'unrealized',
  * row was added, 0 if skipped.
  */
 function snapshotNetworth_() {
+  // Faction vault is separate from networth but snapshotted at the same moment;
+  // a failure here (no AA) must never affect the networth row.
+  try { snapshotFactionVaultApi_(); } catch (e) { /* ignored */ }
+
   var j = fetchJson_(API + '/user/networth?key=' + key_());
   var n = j.networth || {};
   var money = n.money || {}, items = n.items || {}, assets = n.assets || {};
@@ -130,4 +134,100 @@ function buildCompare_() {
     var data = sheet.getRange(2, 3, rows.length, 6);   // delta .. cum_unrealized
     data.setConditionalFormatRules(cfMoneyRules_(data));
   }
+}
+
+// ========== FACTION VAULT ==========
+//
+// The faction vault is NOT part of Torn's networth total, so it is tracked as a
+// separate balance. Torn's API only exposes it via /faction/{id}/balance, which
+// requires the key's user to have Faction API Access (AA) granted by the faction
+// leader; without it the call errors and the tracker stays manual.
+//
+// FactionVault tab: append-only [ts, date, balance, source] snapshots. The
+// source is 'manual' when you record the balance yourself (Torn > 10) or 'api'
+// when it was pulled automatically — the API path becomes active the moment AA
+// is granted.
+
+var FACTION_VAULT_HEADERS = ['ts', 'date', 'balance', 'source'];
+
+/** Player id + faction id, fetched once and cached in Script Properties. The
+ *  ids only change if you leave/join a faction or switch accounts — delete
+ *  PLAYER_ID / FACTION_ID from Script Properties to refresh them. */
+function factionIds_() {
+  var props = PropertiesService.getScriptProperties();
+  var pid = props.getProperty('PLAYER_ID');
+  var fid = props.getProperty('FACTION_ID');
+  if (pid && fid) return { playerId: pid, factionId: fid };
+  var profile = fetchJson_(API + '/user/profile?key=' + key_()).profile || {};
+  var f = fetchJson_(API + '/user/faction?key=' + key_()).faction || {};
+  if (profile.id) props.setProperty('PLAYER_ID', String(profile.id));
+  if (f.id) props.setProperty('FACTION_ID', String(f.id));
+  return { playerId: profile.id, factionId: f.id };
+}
+
+/**
+ * Your personal faction-vault money balance via the API, or null when it is not
+ * available (no Faction API Access, or an unexpected response shape). Never
+ * throws — the manual snapshot path is the fallback.
+ */
+function factionVaultBalanceFromApi_() {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    // Failed probes (no AA) back off for 6h so every sync does not waste a
+    // request; a successful probe resets it, so AA is picked up quickly.
+    if (Date.now() < Number(props.getProperty('FACTION_VAULT_SKIP_UNTIL') || 0)) return null;
+    var ids = factionIds_();
+    if (!ids.playerId || !ids.factionId) return null;
+    var j = fetchJson_(API + '/faction/' + ids.factionId + '/balance?key=' + key_());
+    if (j.error) {
+      props.setProperty('FACTION_VAULT_SKIP_UNTIL', String(Date.now() + 6 * 3600000));
+      return null;                                   // AA not granted — silent
+    }
+    props.deleteProperty('FACTION_VAULT_SKIP_UNTIL');
+    var b = j.balance || j;                         // tolerate wrapping
+    var m = b[String(ids.playerId)];                // per-member balance map
+    if (m && typeof m.money_balance === 'number') return m.money_balance;
+    if (m && typeof m.money === 'number') return m.money;
+    if (typeof b.money_balance === 'number') return b.money_balance;
+    return null;
+  } catch (e) {
+    PropertiesService.getScriptProperties()
+      .setProperty('FACTION_VAULT_SKIP_UNTIL', String(Date.now() + 6 * 3600000));
+    return null;
+  }
+}
+
+/** Append a faction-vault snapshot row. */
+function appendFactionVault_(balance, source) {
+  var sheet = tab_(TABS.FVAULT, FACTION_VAULT_HEADERS);
+  var ts = Math.floor(Date.now() / 1000);
+  sheet.appendRow([ts, new Date(ts * 1000), balance, source]);
+  return 1;
+}
+
+/** Best-effort auto-snapshot from the API; skipped when AA is unavailable. */
+function snapshotFactionVaultApi_() {
+  var bal = factionVaultBalanceFromApi_();
+  if (bal === null) return 0;
+  var sheet = tab_(TABS.FVAULT, FACTION_VAULT_HEADERS);
+  if (sheet.getLastRow() > 1) {
+    var last = sheet.getRange(sheet.getLastRow(), 1, 1, 4).getValues()[0];
+    if (num_(last[2]) === bal && last[3] === 'api') return 0;  // unchanged
+  }
+  return appendFactionVault_(bal, 'api');
+}
+
+/** Menu entry: record your current faction vault balance (Faction > Vault). */
+function snapshotFactionVault() {
+  var ui = SpreadsheetApp.getUi();
+  var resp = ui.prompt('Snapshot faction vault',
+    'Enter your current faction vault balance (see Faction > Vault), e.g. 523737',
+    ui.ButtonSet.OK_CANCEL);
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+  var raw = String(resp.getResponseText()).replace(/[\s$,]/g, '');
+  var bal = num_(raw);
+  if (bal <= 0) { ui.alert('No valid balance entered — nothing recorded.'); return; }
+  appendFactionVault_(bal, 'manual');
+  buildDashboard_();
+  ss_().toast('Faction vault snapshot added.', 'Torn', 6);
 }

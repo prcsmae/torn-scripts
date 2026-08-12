@@ -14,7 +14,8 @@ var TABS = {
   EXCEPT:   'Exceptions',
   DASH:     'Dashboard',
   NETWORTH: 'Networth',
-  COMPARE:  'Compare'
+  COMPARE:  'Compare',
+  FVAULT:   'FactionVault'
 };
 
 // Torn API v2. The log selection requires a full-access key.

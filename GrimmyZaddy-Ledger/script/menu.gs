@@ -48,5 +48,6 @@ function onOpen() {
     .addItem('7. Rebuild dashboard', 'rebuildDashboard')
     .addItem('8. Diagnose sync', 'diagnoseSync')
     .addItem('9. Snapshot networth', 'snapshotNetworth')
+    .addItem('10. Snapshot faction vault', 'snapshotFactionVault')
     .addToUi();
 }

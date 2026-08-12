@@ -15,6 +15,7 @@ function setupSheets() {
   tab_(TABS.EXCEPT,  ['date', 'log_type', 'title', 'problem', 'raw_data']);
   tab_(TABS.NETWORTH, NETWORTH_HEADERS);
   tab_(TABS.COMPARE, COMPARE_HEADERS);
+  tab_(TABS.FVAULT, FACTION_VAULT_HEADERS);
 
   refreshReference();
   buildCompare_();
