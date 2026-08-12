@@ -23,7 +23,8 @@ function moneyOf_(r, t) {
   // the largest plausible number in the object and produced two wrong answers that
   // both looked entirely reasonable: unix timestamps as flight costs, and a Torn
   // user ID as 4,347,352 of property rent. Every log carries some number, so any
-  // heuristic here eventually picks the wrong one. Return zero and let rebuild()
-  // flag it — a visible gap beats a plausible wrong figure.
-  return 0;
+  // heuristic here eventually picks the wrong one. Return null (not zero) so a
+  // genuinely $0 payout is not mistaken for an unparseable one — rebuild() flags
+  // null and records a visible gap, which beats a plausible wrong figure.
+  return null;
 }

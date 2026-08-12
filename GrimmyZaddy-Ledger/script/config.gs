@@ -19,17 +19,34 @@ var TABS = {
 var API = 'https://api.torn.com/v2';
 
 // Candidate keys used when digging a money amount out of a log's `data` object.
-// Money field names vary wildly by log type — bazaar trades use cost_total,
-// casino wins use won_amount, casino losses use bet_amount, property upkeep uses
-// upkeep_paid, rentals use rent. Order matters: wins carry BOTH bet_amount and
-// won_amount, so won_amount must come first, and the type-specific keys must
-// come before the generic `amount` so a quantity field can never win.
-var MONEY_KEYS = ['cost_total', 'total_cost', 'total', 'cost', 'money',
-                  'money_mugged', 'value', 'worth', 'price',
-                  'won_amount', 'bet_amount', 'upkeep_paid', 'upkeep_due',
-                  'rent', 'bounty_reward', 'interest', 'amount'];
+// Money field names vary wildly by log type, verified against live data:
+//   bazaar/market/abroad trades -> cost_total, item shop sell -> total_value,
+//   casino wins -> won_amount (wins carry BOTH bet_amount and won_amount, so
+//   won_amount must come first), losses -> bet_amount, property upkeep ->
+//   upkeep_paid, rentals -> rent, crimes -> money_gained, faction ->
+//   money_deposited/money_given, company pay -> pay, loans -> returned.
+// Type-specific keys must precede the generic `value`/`amount` so a quantity
+// field can never win.
+var MONEY_KEYS = ['cost_total', 'total_cost', 'total_value', 'total', 'cost',
+                  'money', 'money_mugged', 'money_gained', 'money_given',
+                  'money_deposited', 'money_withdrawn', 'money_received',
+                  'money_sent', 'money_lost', 'money_won', 'pay', 'returned',
+                  'value', 'worth', 'price', 'won_amount', 'bet_amount',
+                  'upkeep_paid', 'upkeep_due', 'rent', 'bounty_reward',
+                  'interest', 'amount'];
 var ITEM_KEYS  = ['item', 'item_id'];
 var QTY_KEYS   = ['quantity', 'qty', 'amount'];
+
+/**
+ * Torn's own log categories that move money, used to filter /user/log so only
+ * income/expense entries are ever downloaded. Verified against /torn/logcategories
+ * and /torn/{id}/logtypes: category 14 "Money outgoing" and category 17
+ * "Money incoming" between them cover every money-moving log type (bazaar and
+ * item-market buys/sells, trade money legs, casino, crime, bank, stocks, bounties,
+ * property, church, jobs...). Extend if you also want e.g. vault (138) or
+ * offshore bank (145) deposits tracked — those are transfers, not income/expense.
+ */
+var MONEY_CATS = [14, 17];
 
 /**
  * Which LogTypeMap directions count as money moving. Anything else — item_loss,

@@ -31,7 +31,7 @@ function rebuild() {
     if (!INCOME_DIRS[t.direction] && !EXPENSE_DIRS[t.direction]) return;
 
     var amount = moneyOf_(r, t);
-    if (!amount) {
+    if (amount === null) {
       flag_(r, INCOME_DIRS[t.direction]
         ? 'Money-in log but no money field found — set money_key on LogTypeMap.'
         : 'Expense log but no money field found — set money_key on LogTypeMap, or ' +
@@ -75,7 +75,7 @@ function readTypeMap_() {
   var sheet = tab_(TABS.TYPES);
   var map = {};
   if (sheet.getLastRow() < 2) return map;
-  sheet.getRange(2, 1, sheet.getLastRow() - 1, 5).getValues().forEach(function (r) {
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, 6).getValues().forEach(function (r) {
     if (!r[0]) return;
     map[String(r[0])] = {
       title: r[1],

@@ -44,8 +44,9 @@ exports; the numeric prefixes only document the execution path.
 Input, edited by you:
 
 - **LogTypeMap** — the control panel. One row per Torn log type: `direction`
-  (how it moves money), `bucket` (grouping label), and an optional `money_key`
-  naming the exact data field that holds the amount.
+  (how it moves money), `bucket` (grouping label), an optional `money_key`
+  naming the exact data field that holds the amount, and the source `category`.
+  Setup pre-fills directions from Torn's own money categories (see below).
 
 Output, rewritten on every rebuild:
 
@@ -68,10 +69,13 @@ Archive:
 | `item_in` | Item enters, money out | Bazaar buy, item market buy, foreign buy |
 | `ignore` | Default. Excluded entirely. | Logins, travel, item use, muggings |
 
-The direction guesser pre-fills sensible values from the log title; treat it as a
-head start and confirm each money type you care about. `money_key` is only needed
-when a log's amount lives in a field `config.gs` does not already recognise — run
-Torn > 5. Inspect a log type to see the actual `data` keys.
+Setup fills directions from Torn's own categorization: every log type in category
+14 ("Money outgoing") becomes `expense`, category 17 ("Money incoming") becomes
+`income`, everything else stays `ignore`. Torn's word for it beats title guessing.
+Treat the result as a head start and confirm each type you care about — you can
+flip any row to `ignore` to exclude it. `money_key` is only needed when a log's
+amount lives in a field `config.gs` does not already recognise — run Torn > 5.
+Inspect a log type to see the actual `data` keys.
 
 ## Design rules
 
@@ -93,8 +97,10 @@ flight costs and a user ID as four million of rent.)
 
 ## Efficiency
 
-- **API v2 with a `log` filter.** Once you map directions, `syncLogs` only
-  requests those log type IDs, so nothing irrelevant is downloaded or stored.
+- **API v2 filtered by Torn's money categories.** `syncLogs` requests only
+  categories 14 ("Money outgoing") and 17 ("Money incoming"), so every
+  income/expense entry is captured automatically — no per-type mapping is needed
+  for coverage, and nothing irrelevant is downloaded or stored.
 - **No item reference.** Setup skips Torn's tens-of-thousands-row items list —
   this ledger only needs the money amount and title, which every log carries.
 - **Batched sheet I/O** — read a range once, build an array, write once.
