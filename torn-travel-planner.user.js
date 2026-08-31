@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Travel Planner
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.4
 // @description  Plan profitable travel routes using live abroad prices (YATA /api/v1/travel/export/) + Torn market values. Per-trip profit, budget allocation, suggested buy-list, active-window (short-haul) & sleep (long-haul) planning.
 // @author       motherBarker (and China)
 // @match        https://www.torn.com/travelagency.php*
@@ -12,6 +12,7 @@
 // @connect      yata.yt
 // @connect      api.prombot.co.uk
 // @connect      raw.githubusercontent.com
+// @connect      mediabros.cc
 // ==/UserScript==
 
 (function () {
@@ -347,6 +348,176 @@
     return d;
   }
 
+  // ========== RESTOCK HISTORY (locally learned, Spud-style) ==========
+  // While a Torn tab is open the abroad feed is snapshotted every minute; 0 ->
+  // positive transitions are recorded as restock events. Predictions then use
+  // the MEDIAN of observed gaps instead of trusting the static restock model,
+  // which fixes items whose modelled interval is faster than reality (e.g.
+  // Neumune Tablets in Switzerland repeatedly promising stock that isn't there).
+  // History shape: { "dest:id": { name, samples:[[tSec,q],...], restocks:[tSec,...], misses, lastPred } }
+  const HIST_KEY = "ttp_restock_history_v1";
+  const MAX_SAMPLES = 240; // ~4h at 60s cadence
+  const MAX_RESTOCKS = 40;
+  const MEDIA_URL = "https://travel.mediabros.cc"; // shared 24/7 restock logger (Spud Travel backend)
+
+  function getHistory() {
+    try {
+      return JSON.parse(localStorage.getItem(HIST_KEY) || "{}");
+    } catch (e) {
+      return {};
+    }
+  }
+  function saveHistory(h) {
+    try {
+      localStorage.setItem(HIST_KEY, JSON.stringify(h));
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  // Record a feed snapshot; detects restock events and quantity declines.
+  function recordSnapshot(abroad) {
+    if (!abroad || !abroad.stocks) return;
+    const h = getHistory();
+    const nowSec = Math.floor(_ttpNow() / 1000);
+    let changed = false;
+    for (const [key, c] of Object.entries(abroad.stocks)) {
+      for (const st of c.stocks || []) {
+        const k = key + ":" + st.id;
+        let e = h[k];
+        if (!e) e = h[k] = { name: st.name, samples: [], restocks: [], misses: 0 };
+        if (e.name !== st.name) e.name = st.name;
+        const prev = e.samples.length ? e.samples[e.samples.length - 1] : null;
+        if (!prev || prev[1] !== st.quantity || nowSec - prev[0] > 300) {
+          e.samples.push([nowSec, st.quantity]);
+          if (e.samples.length > MAX_SAMPLES) e.samples.shift();
+          // Restock event: previous snapshot was 0 and now > 0.
+          if (prev && prev[1] === 0 && st.quantity > 0) {
+            e.restocks.push(nowSec);
+            if (e.restocks.length > MAX_RESTOCKS) e.restocks.shift();
+            e.misses = 0; // a fresh observed cycle resets the miss counter
+          }
+          changed = true;
+        }
+        // Miss correction: still empty past a predicted restock -> the interval
+        // estimate was too fast; widen it progressively (up to 2x after 4 misses).
+        if (st.quantity === 0 && e.lastPred && nowSec > e.lastPred + 120) {
+          e.misses = (e.misses || 0) + 1;
+          e.lastPred = nowSec; // don't double-count the same miss
+          changed = true;
+        }
+      }
+    }
+    if (changed) saveHistory(h);
+  }
+
+  // Next restock from local history: median observed gap, rolled forward to the
+  // upcoming cycle, widened by any unfulfilled predictions (miss correction).
+  function localRestockCycles(destKey, id) {
+    const e = getHistory()[destKey + ":" + id];
+    if (!e || e.restocks.length < 2)
+      return { nextMs: null, intervalMin: null, cycles: e ? e.restocks.length : 0 };
+    const rs = e.restocks;
+    const gaps = [];
+    for (let i = 1; i < rs.length; i++) gaps.push(rs[i] - rs[i - 1]);
+    gaps.sort((a, b) => a - b);
+    const widen = 1 + Math.min(1, 0.25 * (e.misses || 0));
+    const med = Math.round(gaps[Math.floor(gaps.length / 2)] * widen);
+    let next = rs[rs.length - 1] + med;
+    const nowMs = _ttpNow();
+    while (next * 1000 < nowMs) next += med;
+    // Stamp the prediction so recordSnapshot can detect misses (still empty past
+    // the predicted time) and widen the interval on the next pass.
+    const h = getHistory();
+    if (h[destKey + ":" + id]) {
+      h[destKey + ":" + id].lastPred = next; // unix seconds
+      saveHistory(h);
+    }
+    return { nextMs: next * 1000, intervalMin: Math.round(med / 60), cycles: rs.length };
+  }
+
+  // Locally-learned depletion rate (units/min, already buffered by SELL_SAFETY)
+  // from the median of observed quantity declines.
+  function localDepletionRate(destKey, id) {
+    const e = getHistory()[destKey + ":" + id];
+    if (!e || !e.samples || e.samples.length < 3) return null;
+    const rates = [];
+    for (let i = 1; i < e.samples.length; i++) {
+      const t0 = e.samples[i - 1][0], q0 = e.samples[i - 1][1];
+      const t1 = e.samples[i][0], q1 = e.samples[i][1];
+      const dt = (t1 - t0) / 60;
+      if (dt >= 1 && q0 > q1 && q1 >= 0) rates.push((q0 - q1) / dt);
+    }
+    if (!rates.length) return null;
+    rates.sort((a, b) => a - b);
+    return rates[Math.floor(rates.length / 2)] * SELL_SAFETY;
+  }
+
+  // Shared 24/7 restock logger (same backend the Spud Travel script uses).
+  // Returns { "dest:id": { cycles, intervalMin, next } } or null (non-fatal).
+  async function fetchBackend(force) {
+    const url = MEDIA_URL.replace(/\/$/, "") + "/predictions";
+    if (!force) {
+      const cached = getCached(url);
+      if (cached) return cached;
+    }
+    try {
+      const data = await gmFetch(url);
+      if (!data || !data.items) throw new Error("backend: unexpected response");
+      apiCache[url] = { data: data.items, ts: Date.now() };
+      return data.items;
+    } catch (e) {
+      return null;
+    }
+  }
+  let _backend = null; // cached mediabros predictions map
+
+  // Unified restock estimate with source priority:
+  //   live (PromBot nextRestock) > cloud (mediabros) > local history > model.
+  // The static model is deliberately capped at 'med': its interval can be wrong
+  // (the Neumune/Switzerland bug), so a model-only prediction must never rank
+  // like a confirmed one. Returns { nextMs, source, level, label } or null.
+  function restockSource(s, entry, destKey, id, nowMs) {
+    // Stale-feed guard: a "live" nextRestock from a feed older than 10 minutes
+    // may already be past (stale export); do not present it as actionable.
+    const feedAgeMin =
+      lastData && lastData.fetchedAt ? (_ttpNow() - lastData.fetchedAt) / 60000 : 0;
+    const live =
+      s && s.nextRestock != null && feedAgeMin <= 10 ? toMs(s.nextRestock) : null;
+    if (live != null && live > nowMs)
+      return { nextMs: live, source: "live", level: "high", label: "live" };
+    const local = destKey ? localRestockCycles(destKey, id) : { nextMs: null, cycles: 0 };
+    const cloud = (_backend && destKey && _backend[destKey + ":" + id]) || null;
+    if (cloud && cloud.next && (cloud.cycles || 0) >= (local.cycles || 0)) {
+      const cm = toMs(cloud.next);
+      if (cm != null)
+        return {
+          nextMs: cm,
+          source: "cloud",
+          level: (cloud.cycles || 0) >= 4 ? "high" : "med",
+          label: "cloud",
+        };
+    }
+    if (local.nextMs && local.cycles >= 2)
+      return {
+        nextMs: local.nextMs,
+        source: "local",
+        level: local.cycles >= 4 ? "high" : "med",
+        label: "learned",
+      };
+    const model = itemNextRestockMs(s, entry, nowMs);
+    if (model != null) {
+      const rel = (entry && entry.rel) || "low";
+      return {
+        nextMs: model,
+        source: "model",
+        level: rel === "low" ? "low" : "med", // model-only is never 'high'
+        label: "model",
+      };
+    }
+    return null;
+  }
+
   // ========== RESTOCK + NERVE HELPERS ==========
   // YATA/PromBot may give nextRestock as seconds, milliseconds, or an ISO string.
   function toMs(v) {
@@ -421,10 +592,18 @@
   // Predicted minutes until an in-stock item sells out, from the model's sellRate
   // (mirrors foreign-stock: buffered so we err toward 'sells out sooner').
   const SELL_SAFETY = 1.15;
-  function depletionInfo(qty, entry) {
-    if (qty > 0 && entry && typeof entry.sellRate === "number" && isFinite(entry.sellRate)) {
-      const rate = entry.sellRate * SELL_SAFETY;
-      if (rate > 0) return { depletesMin: qty / rate };
+  function depletionInfo(qty, entry, destKey, id) {
+    if (qty > 0) {
+      // Prefer the fastest known decline so we err toward "sells out sooner".
+      const rates = [];
+      const localRate = destKey ? localDepletionRate(destKey, id) : null;
+      if (localRate && isFinite(localRate) && localRate > 0) rates.push(localRate);
+      if (entry && typeof entry.sellRate === "number" && isFinite(entry.sellRate))
+        rates.push(entry.sellRate * SELL_SAFETY);
+      if (rates.length) {
+        const rate = Math.max(...rates);
+        if (rate > 0) return { depletesMin: qty / rate, rate };
+      }
     }
     return null;
   }
@@ -452,11 +631,11 @@
   // the buffered sell rate: if the fresh stock sells out again before you
   // land the item is marked empty.
   var POST_ARRIVAL_MINS = 5; // min you're willing to wait on the ground
-  function landingAvailability(s, entry, nowMs, arrivalMs, stockWindowMin) {
+  function landingAvailability(s, entry, nowMs, arrivalMs, stockWindowMin, destKey) {
     const qty = typeof s.quantity === "number" ? s.quantity : 0;
     if (qty > 0) {
       const conf = { level: "high", label: "high" };
-      const dep = depletionInfo(qty, entry);
+      const dep = depletionInfo(qty, entry, destKey, s.id);
       const flightMin = (arrivalMs - nowMs) / 60000;
       const beforeLand = dep ? dep.depletesMin - flightMin : null; // + = after landing, - = before
       // Stock must still be on the shelf when you finish buying on the ground
@@ -560,12 +739,15 @@
         },
       };
     }
-    // Out of stock: confidence gate + restock-vs-landing.
-    const conf = restockConfidence(s, entry);
+    // Out of stock: confidence gate + restock-vs-landing. The confidence now
+    // reflects the SOURCE (live/cloud/learned/model), so model-only guesses are
+    // held to the same standard as the user's confidence setting.
+    const src = restockSource(s, entry, destKey, s.id, nowMs);
+    const conf = { level: src ? src.level : "low", label: src ? src.label : "low" };
     if (confRank(state.restockConfidence || "med") > confRank(conf.level)) {
       return { status: "empty", qty: 0, note: "restock too uncertain", conf };
     }
-    const nrMs = itemNextRestockMs(s, entry, nowMs);
+    const nrMs = src ? src.nextMs : null;
     const byMs = arrivalMs + (stockWindowMin || 0) * 60000 - RESTOCK_CUSHION_MIN * 60000;
     // Only claim "restocked before you land" when the restock truly precedes
     // arrival; a positive stockWindow can push byMs past arrival, and restocks
@@ -652,7 +834,113 @@
     };
   }
 
+  // ========== DEPARTURE PLANNING (local time) ==========
+  // Format a unix-ms timestamp as the user's local HH:MM (DST-safe via Date).
+  function localHHMM(ms) {
+    const d = new Date(ms);
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+
+  // When should the user LEAVE so the item is on the shelf when they land?
+  //   now    - in stock on arrival (or a restock lands before arrival): go now
+  //   timed  - leave at departAtMs (local time) so arrival meets the restock
+  //   null   - no viable departure window
+  function departurePlan(s, entry, nowMs, oneWayMin, destKey, stockWindowMin) {
+    const oneWayMs = oneWayMin * 60000;
+    const arrivalMs = nowMs + oneWayMs;
+    if (typeof s.quantity === "number" && s.quantity > 0) {
+      const ld = landingAvailability(s, entry, nowMs, arrivalMs, stockWindowMin, destKey);
+      if (ld.status !== "empty")
+        return {
+          status: "now",
+          departAtMs: nowMs,
+          landAtMs: arrivalMs,
+          ld,
+          source: ld.conf ? { label: ld.conf.label, level: ld.conf.level } : null,
+        };
+      // In stock now but will be gone: a restock may still land in time.
+    }
+    const src = restockSource(s, entry, destKey, s.id, nowMs);
+    if (!src || !(src.nextMs > nowMs)) return null;
+    const departAtMs = src.nextMs - oneWayMs;
+    if (departAtMs < nowMs - 5 * 60000) return null; // window already passed
+    return {
+      status: departAtMs <= nowMs ? "now" : "timed",
+      departAtMs,
+      landAtMs: src.nextMs,
+      source: { label: src.label, level: src.level },
+    };
+  }
+
   // ========== CORE COMPUTATION ==========
+  // Total net-of-nothing (pre-travel-cost) profit over `trips` consecutive round
+  // trips to one destination, with EACH trip's buy-list allocated against the
+  // shelf that will actually remain at ITS landing. Trip 1 uses the landing
+  // availability already computed for the main buy list; later trips face that
+  // same shelf after it kept draining at the buffered sell rate for another
+  // round trip — and it only refills when the item's restock cycle fits inside
+  // a round trip. Returns null when no candidate has a usable depletion rate,
+  // so the caller can keep the flat trips × trip-profit estimate rather than
+  // invent one. Pure apart from scratch fields on `cands` (c._shelfLevel).
+  function simulateWindowProfit(cands, trips, roundTripMin, cap, budget, destKey) {
+    const rateOf = new Map();  // cand -> buffered units/min, or null
+    const refillOf = new Map(); // cand -> fresh-cycle qty when its restock cycle fits, else null
+    let anyRate = false;
+    for (const c of cands) {
+      const qty = typeof c.s.quantity === "number" ? c.s.quantity : 0;
+      const dep = depletionInfo(qty, c.entry, destKey, c.id);
+      rateOf.set(c, dep ? dep.rate : null);
+      if (dep) anyRate = true;
+      const itv =
+        c.entry && typeof c.entry.interval === "number" && c.entry.interval > 0
+          ? c.entry.interval
+          : null;
+      // A restock helps later trips only if another cycle completes within one
+      // round trip; the fresh shelf is the modeled cycle quantity (fall back to
+      // what the feed showed this cycle).
+      refillOf.set(
+        c,
+        itv && itv <= roundTripMin ? modelRestockQty(c.entry) || c.stockQty : null,
+      );
+    }
+    if (!anyRate) return null;
+
+    const sorted = [...cands].sort((a, b) => b.unitNet - a.unitNet);
+    let windowProfit = 0;
+    for (let k = 1; k <= trips; k++) {
+      let remaining = budget;
+      let slotsUsed = 0;
+      for (const c of sorted) {
+        if (remaining < 1 || slotsUsed >= cap) break;
+        let shelf;
+        if (k === 1) {
+          shelf = c.stockQty; // same landing availability the main buy list used
+        } else {
+          const rate = rateOf.get(c);
+          const rf = refillOf.get(c);
+          if (rf != null) {
+            shelf = rf; // a fresh cycle lands between trips
+          } else {
+            const prev = c._shelfLevel != null ? c._shelfLevel : c.stockQty;
+            shelf = rate != null ? prev - rate * roundTripMin : 0; // no refill, no rate -> assume drained
+          }
+          shelf = Math.floor(shelf);
+        }
+        const q = Math.max(
+          0,
+          Math.min(cap - slotsUsed, Math.floor(remaining / c.cost), shelf),
+        );
+        // What you buy comes off the same shelf later trips buy from.
+        c._shelfLevel = shelf - q;
+        if (q <= 0) continue;
+        remaining -= c.cost * q;
+        slotsUsed += q;
+        windowProfit += c.unitNet * q;
+      }
+    }
+    return windowProfit;
+  }
+
   // Build one row per destination with trip profit (budget-allocated buy-list),
   // PPH, active-window profit, suggested top items, restock/nerve awareness.
   function computeDestinations(abroad, items, models, nerve) {
@@ -673,6 +961,8 @@
       // --- Candidate items with real net profit, buying only what is in stock on arrival ---
       const arrivalMs = nowMs + oneWay * 60000;
       const cands = [];
+      const candsById = {};
+      let rowDepart = null;
       for (const s of stock) {
         const it = items[s.id];
         if (!it) continue;
@@ -686,7 +976,7 @@
         let stockQty = typeof s.quantity === "number" ? s.quantity : 0;
         let landing = null;
         if (state.respectStock) {
-          landing = landingAvailability(s, entry, nowMs, arrivalMs, state.stockWindow);
+          landing = landingAvailability(s, entry, nowMs, arrivalMs, state.stockWindow, key);
           if (landing.status === "empty") continue; // won't be buyable when you land
           stockQty = landing.qty;
         }
@@ -698,7 +988,10 @@
           received,
           unitNet,
           landing,
+          s, // original feed entry - needed for departure planning
+          entry,
         });
+        candsById[s.id] = cands[cands.length - 1];
       }
       cands.sort((a, b) => b.unitNet - a.unitNet);
 
@@ -717,6 +1010,7 @@
           continue;
         }
         buyList.push({
+          id: c.id,
           name: c.name,
           qty,
           cost: c.cost,
@@ -744,10 +1038,43 @@
       // Active window: how many full round trips fit
       const trips =
         windowMin != null && roundTripMin > 0 ? Math.floor(windowMin / roundTripMin) : 0;
-      const windowProfit = trips * tripProfitNet;
+      // Repeat trips compete with the same shelf: it keeps draining at the
+      // learned depletion rate while you fly back and forth, and refills only
+      // when a restock cycle fits inside a round trip. Allocate each trip
+      // against the shelf remaining at its own landing instead of assuming the
+      // trip-1 list repeats verbatim; without a depletion rate the flat
+      // trips × trip-profit estimate is kept (no invented numbers).
+      let windowProfit = trips * tripProfitNet;
+      if (trips > 1 && cands.length) {
+        const sim = simulateWindowProfit(
+          cands,
+          trips,
+          roundTripMin,
+          cap,
+          state.budget,
+          key,
+        );
+        if (sim != null) windowProfit = sim - travelCost * trips;
+      }
 
       const top = buyList.slice(0, 3);
       const nrv = nerveInfo(roundTripMin, nerve);
+
+      // Departure guidance: prefer an item that is buyable on arrival ("now");
+      // otherwise the earliest timed departure across the whole buy list.
+      let timedDepart = null;
+      for (const b of buyList) {
+        const c0 = candsById[b.id];
+        if (!c0) continue;
+        const dep = departurePlan(c0.s, c0.entry, nowMs, oneWay, key, state.stockWindow);
+        if (!dep) continue;
+        if (dep.status === "now") {
+          rowDepart = dep;
+          break;
+        }
+        if (!timedDepart || dep.departAtMs < timedDepart.departAtMs) timedDepart = dep;
+      }
+      if (!rowDepart) rowDepart = timedDepart;
 
       rows.push({
         key,
@@ -756,6 +1083,8 @@
         oneWay,
         travelCost,
         cap,
+        depart: null, // filled below
+        departSort: -Infinity,
         roundTripMin,
         roundTripHours,
         pph,
@@ -770,11 +1099,26 @@
         top,
         buyList,
       });
+      const row = rows[rows.length - 1];
+      row.depart = rowDepart;
+      row.departSort = rowDepart ? rowDepart.departAtMs : -Infinity;
     }
 
-    // Sort for table default: recommended (PPH high, or window profit when window active)
+    // Sort for table default: recommended (PPH high, or window profit when window
+    // active). Prediction-driven routes are DEMOTED by confidence: a destination
+    // that only works because the static model claims a restock (the old
+    // Neumune/Switzerland phantom) can no longer outrank real in-stock items.
     const sortKey = windowMin != null ? "windowProfit" : "pph";
-    rows.sort((a, b) => b[sortKey] - a[sortKey]);
+    const confDiscount = { high: 1, med: 0.75, low: 0.5 };
+    for (const r of rows) {
+      const t0 = r.top.length ? r.top[0] : null;
+      const predicted = !!(t0 && t0.landing && t0.landing.status === "restock");
+      const lvl = predicted && t0.landing.conf ? t0.landing.conf.level : "high";
+      // Only scale positive PPH - a discount would flatter money-losing routes.
+      r.rankPph =
+        r.pph > 0 ? r.pph * (confDiscount[lvl] != null ? confDiscount[lvl] : 0.5) : r.pph;
+    }
+    rows.sort((a, b) => b.rankPph - a.rankPph || b[sortKey] - a[sortKey]);
     return { rows, windowMin, sortKey, nerve };
   }
 
@@ -812,7 +1156,8 @@
         if (unitNet <= 0) continue;
         const entry = models && models[key] ? models[key][s.id] : null;
         const qtyNow = typeof s.quantity === "number" ? s.quantity : 0;
-        const R = itemNextRestockMs(s, entry, nowMs);
+        const src0 = restockSource(s, entry, key, s.id, nowMs);
+        const R = src0 ? src0.nextMs : null;
         const rate =
           entry && typeof entry.sellRate === "number" && isFinite(entry.sellRate)
             ? entry.sellRate
@@ -820,7 +1165,7 @@
 
         // --- Scenario "now": land at now + flight ---
         const arrivalNow = nowMs + oneWay * 60000;
-        const ld = landingAvailability(s, entry, nowMs, arrivalNow, state.stockWindow);
+        const ld = landingAvailability(s, entry, nowMs, arrivalNow, state.stockWindow, key);
         let availNow = 0;
         let noteNow = "";
         if (ld.status === "instock") {
@@ -852,7 +1197,7 @@
 
         // --- Scenario "timed": land ~R + window + cushion after the restock ---
         if (R) {
-          const conf = restockConfidence(s, entry);
+          const conf = { level: src0 ? src0.level : "low", label: src0 ? src0.label : "low" };
           // Same confidence gate as the main planner: never time a departure
           // to a restock estimate we wouldn't trust out-of-stock.
           if (confRank(state.restockConfidence || "med") <= confRank(conf.level)) {
@@ -993,36 +1338,50 @@
     { key: "pph", label: "PPH" },
     { key: "windowProfit", label: "Window profit" },
     { key: "budgetSpent", label: "Budget spent" },
+    { key: "departSort", label: "Depart (local)" },
   ];
 
   function colorFor(v) {
-    return v >= 0 ? "#28a745" : "#dc3545";
+    return v >= 0 ? "#3fb950" : "#f85149";
+  }
+  // Pill badge for the buy-at-arrival status. cls: ok | wait | bad | mut.
+  function badge(text, cls, title) {
+    return `<span class="ttp-badge ${cls}"${title ? ` title="${title}"` : ""}>${text}</span>`;
   }
   function landingTag(ld) {
     if (!ld) return "";
+    const conf = ld.conf ? ld.conf.label : "";
     if (ld.status === "restock") {
       const before = ld.beforeLanding != null ? ld.beforeLanding : "?";
       const inMin = ld.restockIn != null ? ld.restockIn : "?";
-      const conf = ld.conf ? ld.conf.label : "";
       // Post-arrival restock: beforeLanding is negative (or 0 when the
       // restock coincides with landing); use the note instead.
       if (typeof before === "number" && before <= 0) {
-        return `<span style="color:#c9a227;font-size:10px;" title="Restocks in ~${inMin}m from now (~${-before}m after you land) — confidence: ${conf}">🟡 ${ld.note || "restocks shortly after you land"}${conf ? " · " + conf : ""}</span>`;
+        return (
+          badge("RESTOCKS +" + Math.max(1, -before) + "m AFTER LAND", "wait", "Restocks in ~" + inMin + "m from now (~" + -before + "m after you land) — " + conf) +
+          (conf ? ` <span class="ttp-conf">${conf}</span>` : "")
+        );
       }
-      return `<span style="color:#c9a227;font-size:10px;" title="Restocks in ~${inMin}m from now (~${before}m before you land) — confidence: ${conf}">🟡 restocks ~${before}m before you land${conf ? " · " + conf : ""}</span>`;
+      return (
+        badge("RESTOCKS ~" + before + "m BEFORE LAND", "wait", "Restocks in ~" + inMin + "m from now — " + conf) +
+        (conf ? ` <span class="ttp-conf">${conf}</span>` : "")
+      );
     }
     if (ld.status === "instock" && ld.depletion) {
       if (ld.depletion.sellsOutBeforeLand)
-        return `<span style="color:#d8736a;font-size:10px;" title="In stock now, but predicted sold out ~${ld.depletion.beforeLanding}m before you land">🔴 depletes ~${ld.depletion.beforeLanding}m before you land</span>`;
+        return badge("GONE ~" + ld.depletion.beforeLanding + "m BEFORE LAND", "bad", "In stock now, but predicted sold out ~" + ld.depletion.beforeLanding + "m before you land");
       if (ld.depletion.beforeLanding != null)
-        return `<span style="color:#51c97a;font-size:10px;" title="In stock; predicted to sell out ~${ld.depletion.beforeLanding}m after you land">🟢 in stock · sells out ~${ld.depletion.beforeLanding}m after you land</span>`;
+        return (
+          badge("IN STOCK", "ok") +
+          ` <span class="ttp-conf">sells out ~${ld.depletion.beforeLanding}m after you land</span>`
+        );
     }
     if (ld.status === "instock")
-      return '<span style="color:#28a745;font-size:10px;">🟢 in stock</span>';
+      return badge("IN STOCK", "ok");
     // empty with a useful note
     if (ld.note && ld.note !== "empty at landing")
-      return `<span style="color:#d8736a;font-size:10px;" title="${ld.note}">🔴 ${ld.note}</span>`;
-    return '<span style="color:#dc3545;font-size:10px;">🔴 empty</span>';
+      return badge("EMPTY", "bad", ld.note) + (conf ? ` <span class="ttp-conf">${conf}</span>` : "");
+    return badge("EMPTY", "bad");
   }
 
   // ========== SUMMARY (recommended route + sleep) ==========
@@ -1054,6 +1413,8 @@
       html += `<div style="font-weight:bold;color:#28a745;">★ Recommended route${useWindow ? " (active window)" : ""}</div>`;
       html += `<div><b>${best.name} (${best.city})</b> — ${useWindow ? metric : ""}</div>`;
       html += `<div style="color:#bbb;font-size:12px;">${useWindow ? "PPH " + pphStr(best.pph) + " · " : ""}RT ${hours(best.roundTripMin)} · Buy: ${topBuy}</div>`;
+      // Departure times live in the table's "Depart (local)" column — the
+      // recommended route is always the top row there, so no duplicate here.
       if (second) {
         html += `<div style="color:#bbb;font-size:12px;margin-top:4px;">Runner-up: <b>${second.name}</b> — ${signed(second.tripProfitNet)}/trip · ${pphStr(second.pph)}</div>`;
       }
@@ -1085,7 +1446,7 @@
       const depItem = timedPick ? c.buyList[0] : null;
       const confLbl =
         depItem && depItem.conf && depItem.conf.level !== "high"
-          ? ` · <span style="color:#c9a227;">${depItem.conf.label} confidence</span>`
+          ? ` · <span style="color:#d29922;">${depItem.conf.label} confidence</span>`
           : "";
       const departTxt = timedPick
         ? `Depart in <b>${hours(depItem.dep)}</b> — land <b>${depItem.after}m</b> after restock${confLbl}`
@@ -1097,7 +1458,7 @@
             : `Arrival overruns your ${state.sleepHours}h sleep — will wake mid-trip`
           : "Set sleep hours to time the restock";
       html += `<div class="ttp-sleep" style="background:rgba(79,195,247,0.10);border:1px solid rgba(79,195,247,0.45);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
-      html += `<div style="font-weight:bold;color:#4fc3f7;">😴 Sleep plan — best item stocked at arrival</div>`;
+      html += `<div style="font-weight:bold;color:#58a6ff;">😴 Sleep plan — best item stocked at arrival</div>`;
       html += `<div>Fly to <b>${c.name} (${c.city})</b> — one-way ${hours(c.oneWay)} · ${departTxt}</div>`;
       html += `<div style="color:#bbb;font-size:12px;">💰 ${signed(c.profitNet)} net (spend ${money(c.budgetSpent)}, ${c.slots} slots) · Buy: ${top}</div>`;
       html += `<div style="color:#bbb;font-size:12px;">${fitsTxt}</div>`;
@@ -1110,7 +1471,7 @@
       html += `</div>`;
     } else if (sleep && !sleep.rows.length) {
       html += `<div class="ttp-sleep" style="background:rgba(79,195,247,0.10);border:1px solid rgba(79,195,247,0.45);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
-      html += `<div style="font-weight:bold;color:#4fc3f7;">😴 Sleep plan</div>`;
+      html += `<div style="font-weight:bold;color:#58a6ff;">😴 Sleep plan</div>`;
       html += `<div style="color:#bbb;font-size:12px;">No item will be profitably in stock at any destination within your settings (budget/capacity/net%/restock confidence).</div>`;
       html += `</div>`;
     }
@@ -1137,6 +1498,7 @@
       return dir * (va - vb || a.pph - b.pph);
     });
 
+    let rowIdx = 0;
     let html =
       '<table class="ttp-table" style="width:100%;border-collapse:collapse;font-size:12px;">';
     html += '<thead><tr style="border-bottom:1px solid rgba(255,255,255,0.15);text-align:left;">';
@@ -1149,13 +1511,31 @@
 
     for (const r of rows) {
       const isBest = r === computed.rows[0];
-      html += `<tr style="border-bottom:1px solid rgba(255,255,255,0.06);${isBest ? "background:rgba(40,167,69,0.08);" : ""}">`;
+      const idx = rowIdx++;
+      html += `<tr class="ttp-row" data-idx="${idx}" style="border-bottom:1px solid rgba(255,255,255,0.06);${isBest ? "background:rgba(40,167,69,0.08);" : ""}cursor:pointer;">`;
       html += `<td style="padding:5px 6px;"><b style="color:#f2f2f2;">${r.name}</b><br><span style="color:#c9c9c9;font-size:11px;">${r.city}</span></td>`;
       html += `<td style="padding:5px 6px;white-space:nowrap;"><span style="color:#f2f2f2;font-weight:600;">${hours(r.roundTripMin)}</span><br><span style="color:#b7bdc5;font-size:11px;">1-way ${hours(r.oneWay)}${r.travelCost ? " · cost " + money(r.travelCost) : ""}</span></td>`;
       html += `<td style="padding:5px 6px;white-space:nowrap;color:${colorFor(r.tripProfitNet)};font-weight:bold;">${signed(r.tripProfitNet)}</td>`;
       html += `<td style="padding:5px 6px;white-space:nowrap;color:${colorFor(r.pph)};">${pphStr(r.pph)}</td>`;
       html += `<td style="padding:5px 6px;white-space:nowrap;color:${colorFor(r.windowProfit)};">${computed.windowMin != null ? signed(r.windowProfit) + ' <span style="color:#888;font-size:11px;">(' + r.trips + "×)</span>" : "—"}</td>`;
       html += `<td style="padding:5px 6px;white-space:nowrap;color:#aaa;">${money(r.budgetSpent)}</td>`;
+      // Depart (local): when to head to the airport for the headline item
+      {
+        let depHtml = '<span class="ttp-badge mut">—</span>';
+        if (r.depart) {
+          if (r.depart.status === "now") {
+            depHtml = badge("LEAVE NOW", "ok");
+          } else {
+            const inMin = Math.max(0, Math.round((r.depart.departAtMs - _ttpNow()) / 60000));
+            depHtml =
+              badge(localHHMM(r.depart.departAtMs), "wait") +
+              ` <span class="ttp-conf">in ${inMin}m</span>`;
+          }
+          if (r.depart.source && r.depart.source.label)
+            depHtml += ` <span class="ttp-conf">${r.depart.source.label}</span>`;
+        }
+        html += `<td style="padding:5px 6px;white-space:nowrap;">${depHtml}</td>`;
+      }
       // Top 3 suggested items with qty + unit net
       html += `<td style="padding:5px 6px;">`;
       if (r.top.length) {
@@ -1168,9 +1548,38 @@
         html += '<span style="color:#666;">—</span>';
       }
       html += `</td></tr>`;
+      // Expandable detail row: the FULL buy list with per-item profit lines.
+      const detail = r.buyList
+        .map(
+          (b) =>
+            `<tr><td style="padding:2px 6px;color:#c9d1d9;">${b.name}</td>` +
+            `<td style="padding:2px 6px;color:#c9d1d9;">×${b.qty}</td>` +
+            `<td style="padding:2px 6px;color:#8b949e;">@${money(b.cost)}</td>` +
+            `<td style="padding:2px 6px;color:${colorFor(b.unitNet)};">${signed(b.unitNet)}/u</td>` +
+            `<td style="padding:2px 6px;color:${colorFor(b.profit)};font-weight:600;">${signed(b.profit)}</td>` +
+            `<td style="padding:2px 6px;">${landingTag(b.landing)}</td></tr>`,
+        )
+        .join("");
+      html +=
+        `<tr class="ttp-detail" data-detail="${idx}" style="display:none;background:rgba(88,166,255,0.04);">` +
+        `<td colspan="7" style="padding:6px 18px;">` +
+        `<div style="color:#8b949e;font-size:11px;margin-bottom:2px;">Buy list — ${r.name} · spend ${money(r.budgetSpent)} · ${r.slots}/${r.cap} slots</div>` +
+        `<table style="width:100%;border-collapse:collapse;font-size:11px;">` +
+        `<thead><tr style="color:#8b949e;text-align:left;"><th style="padding:2px 6px;">Item</th><th style="padding:2px 6px;">Qty</th><th style="padding:2px 6px;">Buy</th><th style="padding:2px 6px;">Net/unit</th><th style="padding:2px 6px;">Profit</th><th style="padding:2px 6px;">Arrival</th></tr></thead>` +
+        `<tbody>${detail}</tbody></table></td></tr>`;
     }
     html += "</tbody></table>";
     tableWrap.innerHTML = html;
+
+    // wire row clicks: toggle the per-item profit detail row
+    tableWrap.querySelectorAll("tr.ttp-row").forEach((tr) => {
+      tr.addEventListener("click", () => {
+        const d = tableWrap.querySelector(
+          'tr.ttp-detail[data-detail="' + tr.getAttribute("data-idx") + '"]',
+        );
+        if (d) d.style.display = d.style.display === "none" ? "" : "none";
+      });
+    });
 
     // wire header clicks
     tableWrap.querySelectorAll("th[data-key]").forEach((th) => {
@@ -1246,14 +1655,15 @@
     }
     if (statusEl)
       statusEl.innerHTML =
-        '<span style="color:#4fc3f7;">⏳ Fetching abroad prices + item values + restock/nerve…</span>';
+        '<span style="color:#58a6ff;">⏳ Fetching abroad prices + item values + restock/nerve…</span>';
 
     try {
-      const [abroad, items, model, nerve] = await Promise.all([
+      const [abroad, items, model, nerve, backend] = await Promise.all([
         fetchAbroad(force),
         fetchItems(force),
         fetchModelSafe(force),
         fetchNerveSafe(force),
+        fetchBackend(force),
       ]);
       if (seq !== updateSeq) return;
       const itemMap = {};
@@ -1265,6 +1675,8 @@
         nerve,
         fetchedAt: Date.now(),
       };
+      _backend = backend; // shared 24/7 restock predictions (may be null)
+      recordSnapshot(abroad); // feed the locally-learned restock history
       renderResults();
     } catch (e) {
       if (seq !== updateSeq) return;
@@ -1307,7 +1719,7 @@
     inp.step = step || 1;
     inp.value = value;
     inp.style.cssText =
-      "background:#0f0f0f;border:1px solid #333;color:#fff;border-radius:3px;padding:3px 6px;font-size:12px;width:" +
+      "background:#0f0f0f;border:1px solid #30363d;color:#fff;border-radius:3px;padding:3px 6px;font-size:12px;width:" +
       (w || "70px") +
       ";";
     inp.addEventListener("change", () => onchange(parseFloat(inp.value)));
@@ -1331,7 +1743,7 @@
     container.style.cssText =
       "position:fixed;top:20px;left:50%;transform:translateX(-50%);" +
       "z-index:99999;width:min(1150px,96vw);max-height:calc(100vh - 40px);" +
-      "background:#111;color:#fff;border:1px solid #333;border-radius:8px;" +
+      "background:#0d1117;color:#fff;border:1px solid #30363d;border-radius:8px;" +
       "display:flex;flex-direction:column;box-sizing:border-box;" +
       "box-shadow:0 6px 24px rgba(0,0,0,0.7);overflow-y:auto;overflow-x:auto;" +
       "font-family:Arial,sans-serif;font-size:13px;";
@@ -1340,10 +1752,10 @@
     const header = document.createElement("div");
     header.id = "ttp-header";
     header.style.cssText =
-      "display:flex;align-items:center;justify-content:space-between;padding:9px 14px;background:#1a1a1a;border-bottom:1px solid #333;cursor:grab;user-select:none;";
+      "display:flex;align-items:center;justify-content:space-between;padding:9px 14px;background:#161b22;border-bottom:1px solid #30363d;cursor:grab;user-select:none;";
     const title = document.createElement("span");
     title.textContent = "✈️ Torn Travel Planner";
-    title.style.cssText = "font-weight:bold;font-size:15px;color:#4fc3f7;";
+    title.style.cssText = "font-weight:bold;font-size:15px;color:#58a6ff;";
     const btns = document.createElement("div");
     btns.style.cssText = "display:flex;gap:6px;";
     const minBtn = document.createElement("button");
@@ -1354,16 +1766,7 @@
       e.stopPropagation();
       setMinimized(!panelMinimized);
     });
-    const closeBtn = document.createElement("button");
-    closeBtn.textContent = "✕";
-    closeBtn.style.cssText = btnStyle();
-    closeBtn.title = "Minimize to button (never loses the panel)";
-    closeBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      setMinimized(true);
-    });
     btns.appendChild(minBtn);
-    btns.appendChild(closeBtn);
     header.appendChild(title);
     header.appendChild(btns);
     container.appendChild(header);
@@ -1571,7 +1974,7 @@
     refreshBtn.id = "ttp-refresh";
     refreshBtn.textContent = "🔄 Refresh";
     refreshBtn.style.cssText =
-      "padding:5px 14px;background:#28a745;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;";
+      "padding:5px 14px;background:#238636;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;";
     refreshBtn.addEventListener("click", () => loadData(true));
 
     ctl.appendChild(field("Travel method", modeSel));
@@ -1589,6 +1992,7 @@
     ctl.appendChild(field("API key", keyInp, "flex-basis:160px;"));
     ctl.appendChild(field("Auto-refresh", autoCb, "justify-content:flex-end;"));
     ctl.appendChild(refreshBtn);
+
 
     body.appendChild(ctl);
 
@@ -1623,7 +2027,7 @@
       (state.miniTop || 130) +
       "px;" +
       "z-index:100000;width:46px;height:46px;border-radius:50%;" +
-      "background:#1a1a1a;border:2px solid #4fc3f7;color:#4fc3f7;font-size:20px;cursor:pointer;" +
+      "background:#161b22;border:2px solid #4fc3f7;color:#58a6ff;font-size:20px;cursor:pointer;" +
       "box-shadow:0 3px 10px rgba(0,0,0,0.6);align-items:center;justify-content:center;" +
       "touch-action:none;user-select:none;";
     miniBtn.textContent = "✈️";
@@ -1669,13 +2073,30 @@
     document.body.appendChild(miniBtn);
     miniButtonEl = miniBtn;
 
-    document.body.appendChild(container);
-
     const st = document.createElement("style");
     st.textContent =
+      "#ttp-root{--ttp-bg:#0d1117;--ttp-panel:#161b22;--ttp-border:#30363d;--ttp-muted:#8b949e;--ttp-accent:#58a6ff;} " +
+      "#ttp-root .ttp-table tbody tr.ttp-row:hover{background:rgba(88,166,255,0.07);} " +
+      "#ttp-root .ttp-table tbody tr.ttp-row{cursor:pointer;} " +
+      "#ttp-root .ttp-table tbody tr.ttp-detail:hover{background:rgba(88,166,255,0.04) !important;} " +
+      "#ttp-root .ttp-table thead th{position:sticky;top:0;background:#161b22;z-index:2;} " +
       "#ttp-root table th:hover{color:#fff;} " +
-      "@media (max-width:700px){#ttp-root{top:12px;left:50%;width:calc(100vw - 24px)!important;" +
-      "max-height:calc(100vh - 24px)!important;max-height:calc(100dvh - 24px)!important;} #ttp-root #ttp-body{padding:8px;}}";
+      "#ttp-root .ttp-badge{display:inline-block;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:700;letter-spacing:0.3px;white-space:nowrap;vertical-align:middle;} " +
+      "#ttp-root .ttp-badge.ok{color:#3fb950;background:rgba(63,185,80,0.15);border:1px solid rgba(63,185,80,0.45);} " +
+      "#ttp-root .ttp-badge.wait{color:#d29922;background:rgba(210,153,34,0.13);border:1px solid rgba(210,153,34,0.45);} " +
+      "#ttp-root .ttp-badge.bad{color:#f85149;background:rgba(248,81,73,0.13);border:1px solid rgba(248,81,73,0.45);} " +
+      "#ttp-root .ttp-badge.mut{color:#8b949e;background:rgba(139,148,158,0.12);border:1px solid rgba(139,148,158,0.4);} " +
+      "#ttp-root .ttp-conf{color:#8b949e;font-size:10px;} " +
+      "@media (max-width:700px){#ttp-root{top:12px;left:50%;width:calc(100vw - 16px)!important;" +
+      "max-height:calc(100vh - 24px)!important;max-height:calc(100dvh - 24px)!important;} #ttp-root #ttp-body{padding:8px;}" +
+      "#ttp-root #ttp-controls{gap:6px;} #ttp-root #ttp-summary{font-size:12px;}" +
+      "#ttp-root .ttp-table{font-size:11px;} #ttp-root .ttp-table th,#ttp-root .ttp-table td{padding:4px 4px;}" +
+      "#ttp-root .ttp-badge{font-size:9px;padding:1px 5px;letter-spacing:0;} " +
+      "#ttp-root .ttp-detail td{padding:4px 8px !important;}}" +
+      "@media (max-width:520px){" +
+      "#ttp-root th[data-key=\"windowProfit\"],#ttp-root td:nth-child(5)," +
+      "#ttp-root th[data-key=\"budgetSpent\"],#ttp-root td:nth-child(6){display:none;}" +
+      "#ttp-root .ttp-table{display:block;overflow-x:auto;white-space:nowrap;}}";
     document.head.appendChild(st);
   }
 
@@ -1683,10 +2104,10 @@
     return "background:none;border:none;color:#aaa;font-size:15px;cursor:pointer;padding:0 6px;line-height:1;";
   }
   function selStyle() {
-    return "background:#0f0f0f;border:1px solid #333;color:#fff;border-radius:3px;padding:3px 6px;font-size:12px;";
+    return "background:#0f0f0f;border:1px solid #30363d;color:#fff;border-radius:3px;padding:3px 6px;font-size:12px;";
   }
   function inputStyle() {
-    return "background:#0f0f0f;border:1px solid #333;color:#fff;border-radius:3px;padding:3px 6px;font-size:12px;";
+    return "background:#0f0f0f;border:1px solid #30363d;color:#fff;border-radius:3px;padding:3px 6px;font-size:12px;";
   }
 
   function setMinimized(min) {
@@ -1702,11 +2123,18 @@
   // ========== INIT ==========
   let refreshTimer = null;
   let statusTimer = null;
+  let feedTimer = null;
   function scheduleAutoRefresh() {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = setInterval(() => {
       if (state.autoRefresh) loadData();
     }, CONFIG.autoRefreshMs);
+    // Spud-style minute cadence: keeps the local restock history granular.
+    // loadData() is cache- and rate-limited, so this stays network-cheap.
+    if (feedTimer) clearInterval(feedTimer);
+    feedTimer = setInterval(() => {
+      if (state.autoRefresh) loadData();
+    }, 60000);
   }
   function scheduleStatusTicker() {
     // Live "Data Xs old" counter — ticks the age every second so it's never frozen.
@@ -1759,6 +2187,17 @@
       RESTOCK_CUSHION_MIN,
       POST_ARRIVAL_MINS,
       SELL_SAFETY,
+      HIST_KEY,
+      getHistory,
+      recordSnapshot,
+      localRestockCycles,
+      localDepletionRate,
+      restockSource,
+      departurePlan,
+      localHHMM,
+      setBackend(v) {
+        _backend = v;
+      },
     };
     module.exports.__setClock = function (fn) {
       _ttpNow = fn || Date.now;
