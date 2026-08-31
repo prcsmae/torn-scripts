@@ -14,10 +14,18 @@ function parseRaw_(r) {
 function moneyOf_(r, t) {
   var d = parseRaw_(r);
 
-  if (t && t.moneyKey && d[t.moneyKey] !== undefined) return num_(d[t.moneyKey]);
+  if (t && t.moneyKey) {
+    var v = moneyExpr_(d, t.moneyKey);
+    if (v !== null) return v;
+  }
 
-  var v = firstKey_(d, MONEY_KEYS);
-  if (v !== null) return num_(v);
+  var v2 = firstKey_(d, MONEY_KEYS);
+  if (v2 !== null) return num_(v2);
+
+  // Compacted rows carry no raw JSON: their money was resolved and frozen into
+  // the money column at compaction time (never null there), so it is
+  // authoritative. Only rows WITH raw JSON get the no-guessing treatment below.
+  if (!r.raw) return num_(r.money);
 
   // No recognised money field, and deliberately no guessing. The old fallback took
   // the largest plausible number in the object and produced two wrong answers that
@@ -27,4 +35,31 @@ function moneyOf_(r, t) {
   // genuinely $0 payout is not mistaken for an unparseable one — rebuild() flags
   // null and records a visible gap, which beats a plausible wrong figure.
   return null;
+}
+
+/**
+ * Resolve a LogTypeMap money_key against a log's data object. Beyond a plain
+ * field name, three tiny derived forms cover log types whose data carries no
+ * directly matchable money field (the amount must be computed — see
+ * DERIVED_MONEY_KEYS in config.gs for which types need this and why):
+ *   'field'       -> data.field
+ *   'field/2'     -> floor(data.field / 2)   (high-low cash in half pays half the pot)
+ *   'field-other' -> data.field - data.other (stock sells pay worth minus fees)
+ * Returns null when the expression references a field the data lacks, so the
+ * row keeps its normal treatment (firstKey_ fallback, then Exceptions).
+ */
+function moneyExpr_(d, expr) {
+  expr = String(expr || '').trim();
+  if (!expr) return null;
+
+  var m = expr.match(/^([A-Za-z_]+)\s*\/\s*2$/);
+  if (m) return d[m[1]] === undefined ? null : Math.floor(num_(d[m[1]]) / 2);
+
+  m = expr.match(/^([A-Za-z_]+)\s*-\s*([A-Za-z_]+)$/);
+  if (m) {
+    return (d[m[1]] !== undefined && d[m[2]] !== undefined)
+      ? num_(d[m[1]]) - num_(d[m[2]]) : null;
+  }
+
+  return d[expr] !== undefined ? num_(d[expr]) : null;
 }

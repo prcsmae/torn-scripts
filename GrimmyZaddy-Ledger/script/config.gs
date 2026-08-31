@@ -15,7 +15,11 @@ var TABS = {
   DASH:     'Dashboard',
   NETWORTH: 'Networth',
   COMPARE:  'Compare',
-  FVAULT:   'FactionVault'
+  FVAULT:   'FactionVault',
+  FLIPS:    'FlipProfit',
+  ITEMS:    'ItemNames',
+  CASHFLOW: 'CashFlow',
+  TODAY:    'Today'
 };
 
 // Torn API v2. The log selection requires a full-access key.
@@ -29,7 +33,9 @@ var API = 'https://api.torn.com/v2';
 //   upkeep_paid, rentals -> rent, crimes -> money_gained, faction ->
 //   money_deposited/money_given, company pay -> pay, loans -> returned.
 // Type-specific keys must precede the generic `value`/`amount` so a quantity
-// field can never win.
+// field can never win. Log types with no matchable field at all are covered by
+// DERIVED_MONEY_KEYS (e.g. high-low cash-in pays pot/2; stock sells pay net
+// of fees) — see config.gs.
 var MONEY_KEYS = ['cost_total', 'total_cost', 'total_value', 'total', 'cost',
                   'money', 'money_mugged', 'money_gained', 'money_given',
                   'money_deposited', 'money_withdrawn', 'money_received',
@@ -39,6 +45,30 @@ var MONEY_KEYS = ['cost_total', 'total_cost', 'total_value', 'total', 'cost',
                   'interest', 'amount'];
 var ITEM_KEYS  = ['item', 'item_id'];
 var QTY_KEYS   = ['quantity', 'qty', 'amount'];
+
+/**
+ * Log types whose `data` carries no field MONEY_KEYS can match, so a plain
+ * money_key cannot express their amount. money_key accepts tiny derived
+ * expressions instead (see moneyExpr_ in parse.gs):
+ *   'field'         -> data.field
+ *   'field/2'       -> floor(data.field / 2)
+ *   'field-other'   -> data.field - data.other
+ *
+ * Verified against live logs:
+ *   8315 "Casino high-low cash in half" -> {"round":N,"pot":P}; the payout is
+ *        half the pot (floored — pot 4651 pays 2325).
+ *   8314 "Casino high-low cash in full" -> same shape; payout is the whole pot
+ *        (inferred from the type name — no live row seen yet).
+ *   5511 "Stock sell" -> worth is gross; the wallet receives worth minus the
+ *        broker fee in data.fees.
+ * Setup writes these into the money_key column of new LogTypeMap rows and
+ * heals blank ones on refresh; an explicitly chosen key is never overwritten.
+ */
+var DERIVED_MONEY_KEYS = {
+  '8315': 'pot/2',
+  '8314': 'pot',
+  '5511': 'worth-fees'
+};
 
 /**
  * Torn's own log categories that move money, used to filter /user/log so only
@@ -54,11 +84,16 @@ var QTY_KEYS   = ['quantity', 'qty', 'amount'];
 var MONEY_CATS = [14, 17, 138, 145];
 
 /**
- * Log types that move money BETWEEN networth buckets without changing the total
- * (bank invest/withdraw, cashier's checks, vault, offshore bank, loans). They
- * must be excluded from the Compare view's "realized" figure, otherwise
+ * Log types that move money between your own accounts — bank invest/withdraw,
+ * cashier's checks, vault, offshore bank, loans, faction vault — which must be
+ * excluded from the Compare view's "realized" figure, otherwise
  * Δnetworth = realized + unrealized would never balance: depositing to the bank
  * looks like an expense and withdrawing like income, while networth is flat.
+ *
+ * Faction vault moves are included even though Torn's networth total does not
+ * track the vault (so a deposit genuinely lowers the reported total): it is the
+ * same wallet<->storage shuffle, the user treats the vault as held money, and
+ * the Dashboard shows the vault balance separately.
  *
  * Verified against /torn/{14,17,138,145}/logtypes. Company (6284/6285) and
  * bookie deposits are deliberately left out: networth's treatment of those
@@ -68,9 +103,69 @@ var MONEY_CATS = [14, 17, 138, 145];
 var TRANSFER_TYPES = {
   '5450': true, '5451': true, '5460': true,   // bank invest/withdraw, cashier's check
   '5850': true, '5851': true,                 // vault deposit/withdraw
+  '6726': true, '6735': true, '6736': true,   // faction vault deposit + gives (see FACTION_VAULT_*)
   '6010': true, '6011': true,                 // offshore bank deposit/withdraw
   '6200': true, '6201': true                  // loan increase/decrease
 };
+
+/**
+ * Trade log types whose ITEM legs the sync fetches with a standalone log=
+ * selection (the log param cannot be combined with cat, so they walk as their
+ * own selection). Only the FINALIZED legs are fetched — they fire exclusively
+ * when a trade actually completes, so cancelled/declined/expired trades never
+ * produce a row:
+ *   4445 "Trade items outgoing" — items you SENT in a completed trade
+ *   4446 "Trade items incoming" — items you RECEIVED in a completed trade
+ * They carry no money (just an items array), so the FlipProfit view values
+ * them at the item catalog's market price.
+ *
+ * The trade MONEY legs (4440/4441) need no special handling: Torn lists them
+ * in categories 14/17, which MONEY_CATS already fetches, and moneyOf_ already
+ * reads their `money` field — so trade cash is in the ledger today.
+ */
+var TRADE_TYPES = [4445, 4446];
+
+/**
+ * Faction vault money movements, verified against /torn/80/logtypes and live
+ * log samples. The vault balance is maintained from these (see
+ * derivedFactionVault_): deposits (6726, money_deposited) add, gives
+ * (6735/6736, money_given) subtract, and a balance-change log is
+ * authoritative — its balance_after IS the balance, no math:
+ *   6737/6738 "Faction money balance change (send|receive)" — fires when any
+ *     banker adjusts the vault balances. The `user` field is the BANKER who
+ *     made the change (it can be anyone with vault access), NOT the balance
+ *     owner — a log in your own feed is always about YOUR balance, so
+ *     balance_after applies unconditionally.
+ *   6795 "Faction payout money balance receive" — organized-crime payout,
+ *     carries balance_before/balance_after too (verified: its 8/14 before
+ *     exactly matched the user's reported vault balance). Also authoritative.
+ *
+ * 6735/6737/6738/6795 live in category 80 (Faction), outside the money
+ * categories the sync walks, so they are fetched with a standalone log=
+ * selection (FACTION_VAULT_SYNC). 6726 is in category 14 and 6736 in
+ * category 17, so they are already synced. The balance fields are NOT in
+ * MONEY_KEYS: rebuild must never treat a vault rebalance as income/expense.
+ */
+var FACTION_VAULT_IN      = { '6726': true };
+var FACTION_VAULT_OUT     = { '6735': true, '6736': true };
+var FACTION_VAULT_BALANCE = { '6737': true, '6738': true, '6795': true };
+var FACTION_VAULT_SYNC    = [6735, 6737, 6738, 6795];
+
+/**
+ * File-size control. RawLog is append-only and every row carries the log's full
+ * JSON payload (raw_data), so the file grows with history. COMPACTION keeps the
+ * math exact while the sheet stays small: once a row is older than
+ * RETENTION_DAYS its money is resolved with the CURRENT LogTypeMap (per-type
+ * money_key overrides included) and frozen into the money column, then raw_data
+ * and the dead datetime/category columns are blanked. Trade legs (4440/4441/
+ * 4445/4446) keep their raw JSON — parsed_trade_id is load-bearing for the flip
+ * view — as do rows whose money cannot be resolved (exception candidates).
+ * Compaction runs automatically once RawLog exceeds COMPACT_AT_ROWS, and on
+ * demand via the menu. Idempotent: re-running it changes nothing.
+ */
+var RETENTION_DAYS = 90;
+var COMPACT_AT_ROWS = 20000;
+var TRADE_RAW_KEEP = { '4440': true, '4441': true, '4445': true, '4446': true };
 
 /** Background tints for conditional formatting: gain / loss / flat. */
 var CF_COLORS = { pos: '#d9ead3', neg: '#f4cccc', neutral: '#eeeeee' };
