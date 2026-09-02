@@ -14,3 +14,5 @@ torn-trade-profit/.git.bak/
 
 # Torn API key — never commit
 GrimmyZaddy-Ledger/script/private.gs
+
+.agents*
