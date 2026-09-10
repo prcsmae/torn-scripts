@@ -1439,15 +1439,13 @@
     // Recommended active route
     if (best) {
       const metric = useWindow
-        ? "💰 " +
-          money(best.windowProfit) +
+        ? money(best.windowProfit) +
           " over " +
           best.trips +
           " trips in your " +
           hours(computed.windowMin) +
           " active window"
-        : "💰 " +
-          signed(best.tripProfitNet) +
+        : signed(best.tripProfitNet) +
           " per trip · " +
           pphStr(best.pph) +
           " · ROI " +
@@ -1465,7 +1463,7 @@
         const n = best.nerve;
         if (state.nerveCare && n.waste > state.nerveWasteLimit) {
           const doSpend = Math.max(0, n.waste - state.nerveWasteLimit);
-          html += `<div style="color:#e2a03f;font-size:12px;margin-top:4px;">🧠 Nerve ${n.now}/${n.max} — this RT wastes <b>~${n.waste}</b> nerve. Spend <b>${doSpend}</b> (down to ~${n.spendTo}) before leaving to avoid capping mid-flight.</div>`;
+          html += `<div style="color:#e2a03f;font-size:12px;margin-top:4px;">Nerve ${n.now}/${n.max} — this RT wastes <b>~${n.waste}</b> nerve. Spend <b>${doSpend}</b> (down to ~${n.spendTo}) before leaving to avoid capping mid-flight.</div>`;
         }
       }
       html += `</div>`;
@@ -1497,24 +1495,24 @@
       const fitsTxt =
         state.sleepHours > 0
           ? c.fits
-            ? `Fits your ${state.sleepHours}h sleep — set an alarm 🛬`
+            ? `Fits your ${state.sleepHours}h sleep — set an alarm`
             : `Arrival overruns your ${state.sleepHours}h sleep — will wake mid-trip`
           : "Set sleep hours to time the restock";
       html += `<div class="ttp-sleep" style="background:rgba(79,195,247,0.10);border:1px solid rgba(79,195,247,0.45);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
-      html += `<div style="font-weight:bold;color:#58a6ff;">😴 Sleep plan — best item stocked at arrival</div>`;
+      html += `<div style="font-weight:bold;color:#58a6ff;">Sleep plan — best item stocked at arrival</div>`;
       html += `<div>Fly to <b>${c.name} (${c.city})</b> — one-way ${hours(c.oneWay)} · ${departTxt}</div>`;
-      html += `<div style="color:#bbb;font-size:12px;">💰 ${signed(c.profitNet)} net (spend ${money(c.budgetSpent)}, ${c.slots} slots) · Buy: ${top}</div>`;
+      html += `<div style="color:#bbb;font-size:12px;">${signed(c.profitNet)} net (spend ${money(c.budgetSpent)}, ${c.slots} slots) · Buy: ${top}</div>`;
       html += `<div style="color:#bbb;font-size:12px;">${fitsTxt}</div>`;
       if (sleep.rows.length > 1) {
         html += `<div style="color:#888;font-size:11px;margin-top:3px;">Alternatives: ${sleep.rows
           .slice(1, 4)
-          .map((r) => `${r.name} ${signed(r.profitNet)}${r.fits ? "" : " ⚠overrun"}`)
+          .map((r) => `${r.name} ${signed(r.profitNet)}${r.fits ? "" : " (over budget)"}`)
           .join(" · ")}</div>`;
       }
       html += `</div>`;
     } else if (sleep && !sleep.rows.length) {
       html += `<div class="ttp-sleep" style="background:rgba(79,195,247,0.10);border:1px solid rgba(79,195,247,0.45);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
-      html += `<div style="font-weight:bold;color:#58a6ff;">😴 Sleep plan</div>`;
+      html += `<div style="font-weight:bold;color:#58a6ff;">Sleep plan</div>`;
       html += `<div style="color:#bbb;font-size:12px;">No item will be profitably in stock at any destination within your settings (budget/capacity/net%/restock confidence).</div>`;
       html += `</div>`;
     }
@@ -1724,14 +1722,14 @@
     } catch (e) {
       if (seq !== updateSeq) return;
       if (statusEl)
-        statusEl.innerHTML = '<span style="color:#dc3545;">⚠️ ' + (e.message || e) + "</span>";
+        statusEl.innerHTML = '<span style="color:#dc3545;">' + (e.message || e) + "</span>";
     } finally {
       loading = false;
       if (seq === updateSeq) {
         const b = document.getElementById("ttp-refresh");
         if (b) {
           b.disabled = false;
-          b.textContent = "🔄 Refresh";
+          b.textContent = "Refresh";
         }
       }
     }
@@ -1870,6 +1868,15 @@
     ["API key", "Optional Torn API key (items + nerve). Needed for the nerve-waste estimate; stored locally in your browser only."],
     ["Auto-refresh", "Re-fetch live prices and restock data every 10 minutes."],
   ];
+  const HELP_FLOW = [
+    ["Set your trip basics", "Pick a travel method (Airstrip / WLT / Business are free and fast), then enter your item capacity, net % (97 is typical for trades) and how much money you want to spend per trip."],
+    ["Tell it when you're awake", "Set your active start/end times and, if you like, how many hours you'll sleep. Departure times and recommendations are timed around this."],
+    ["Hit Refresh", "The script pulls live foreign stock, restock cycles and prices, then scores every destination by profit per hour."],
+    ["Pick a route from the table", "The highlighted row is the best route right now. Every row shows round-trip time, profit, profit-per-hour and departure times so you know exactly when to leave."],
+    ["Read the stock badges", "IN STOCK = on the shelf when you land. RESTOCKS = item refills near your arrival (timing shown). EMPTY / GONE = don't bother — it won't be there."],
+    ["Optional: sleep plan", "Enter your sleep hours and the planner times a departure so the best item is freshly restocked exactly when you wake up."],
+    ["Optional: nerve + API key", "Tick Nerve waste and add an API key to get a warning when a round trip would waste nerve, plus how much to spend before flying."],
+  ];
   function showHelp() {
     const old = document.getElementById("ttp-help");
     if (old) {
@@ -1885,12 +1892,36 @@
     const card = document.createElement("div");
     card.className = "ttp-help-card";
     const h = document.createElement("h3");
-    h.textContent = "✈️ Travel Planner — settings guide";
+    h.textContent = "Travel Planner — how to use";
     const close = document.createElement("button");
     close.className = "ttp-input";
     close.textContent = "Close";
     close.style.cssText = "margin-top:10px;cursor:pointer;";
     close.addEventListener("click", () => ov.remove());
+    card.appendChild(h);
+    // Step-by-step flow
+    const fh = document.createElement("div");
+    fh.className = "h-sec";
+    fh.textContent = "The flow";
+    card.appendChild(fh);
+    HELP_FLOW.forEach(([k, d], i) => {
+      const row = document.createElement("div");
+      row.className = "h-row";
+      const key = document.createElement("span");
+      key.className = "h-k";
+      key.textContent = i + 1 + ". " + k + " — ";
+      const desc = document.createElement("span");
+      desc.className = "h-d";
+      desc.textContent = d;
+      row.appendChild(key);
+      row.appendChild(desc);
+      card.appendChild(row);
+    });
+    // Field reference
+    const rh = document.createElement("div");
+    rh.className = "h-sec";
+    rh.textContent = "Settings reference";
+    card.appendChild(rh);
     for (const [k, d] of HELP_ITEMS) {
       const row = document.createElement("div");
       row.className = "h-row";
@@ -1904,7 +1935,6 @@
       row.appendChild(desc);
       card.appendChild(row);
     }
-    card.appendChild(h);
     card.appendChild(close);
     ov.appendChild(card);
     document.body.appendChild(ov);
@@ -1938,23 +1968,25 @@
     header.style.cssText =
       "display:flex;align-items:center;justify-content:space-between;padding:9px 14px;background:#161b22;border-bottom:1px solid #30363d;cursor:grab;user-select:none;";
     const title = document.createElement("span");
-    title.textContent = "✈️ Torn Travel Planner";
+    title.textContent = "Torn Travel Planner";
     title.style.cssText = "font-weight:bold;font-size:15px;color:#58a6ff;";
     const btns = document.createElement("div");
     btns.style.cssText = "display:flex;gap:6px;";
     const minBtn = document.createElement("button");
     minBtn.className = "ttp-min";
-    minBtn.textContent = "➖";
+    minBtn.textContent = "–";
+    minBtn.title = "Minimize";
     minBtn.style.cssText = btnStyle();
     minBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       setMinimized(!panelMinimized);
     });
     const helpBtn = document.createElement("button");
-    helpBtn.className = "ttp-min";
-    helpBtn.textContent = "?";
-    helpBtn.title = "What each setting does";
-    helpBtn.style.cssText = btnStyle();
+    helpBtn.className = "ttp-helpbtn";
+    helpBtn.textContent = "Help";
+    helpBtn.title = "How to use the travel planner";
+    helpBtn.style.cssText =
+      "background:#1f6feb;color:#fff;border:none;border-radius:4px;font-size:11px;font-weight:bold;padding:3px 10px;cursor:pointer;";
     helpBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       showHelp();
@@ -2190,7 +2222,7 @@
     });
     const refreshBtn = document.createElement("button");
     refreshBtn.id = "ttp-refresh";
-    refreshBtn.textContent = "🔄 Refresh";
+    refreshBtn.textContent = "Refresh";
     refreshBtn.style.cssText =
       "padding:5px 14px;background:#238636;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;";
     refreshBtn.addEventListener("click", () => loadData(true));
@@ -2248,7 +2280,7 @@
       "background:#161b22;border:2px solid #4fc3f7;color:#58a6ff;font-size:20px;cursor:pointer;" +
       "box-shadow:0 3px 10px rgba(0,0,0,0.6);align-items:center;justify-content:center;" +
       "touch-action:none;user-select:none;";
-    miniBtn.textContent = "✈️";
+    miniBtn.textContent = "Travel";
     miniBtn.title = "Torn Travel Planner — tap to open (drag to move)";
     // tap to expand (unless it was a drag)
     let miniDragged = false;
@@ -2328,7 +2360,8 @@
       "#ttp-help h3{margin:0 0 12px;color:#58a6ff;font-size:14px;}" +
       "#ttp-help .h-row{margin-bottom:8px;line-height:1.45;}" +
       "#ttp-help .h-k{color:#e6edf3;font-weight:700;}" +
-      "#ttp-help .h-d{color:#9aa4b2;}";
+      "#ttp-help .h-d{color:#9aa4b2;}" +
+      "#ttp-help .h-sec{margin:14px 0 6px;padding-top:8px;border-top:1px solid #30363d;color:#58a6ff;font-weight:700;font-size:12px;}";
     document.head.appendChild(st);
   }
 
@@ -2343,7 +2376,7 @@
     state.panelHidden = panelMinimized;
     saveState();
     const mb = document.querySelector("#ttp-root #ttp-header .ttp-min");
-    if (mb) mb.textContent = panelMinimized ? "➕" : "➖";
+    if (mb) mb.textContent = panelMinimized ? "+" : "–";
   }
 
   // ========== INIT ==========
