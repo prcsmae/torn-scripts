@@ -2569,7 +2569,11 @@
       "background:#161b22;border:2px solid #4fc3f7;color:#58a6ff;font-size:20px;cursor:pointer;" +
       "box-shadow:0 3px 10px rgba(0,0,0,0.6);align-items:center;justify-content:center;" +
       "touch-action:none;user-select:none;";
-    miniBtn.textContent = "Travel";
+    // Plane icon (inline SVG — not an emoji, renders identically everywhere)
+    miniBtn.innerHTML =
+      '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">' +
+      '<path fill="currentColor" d="M21.5 15.5 13.5 11V5.5A1.5 1.5 0 0 0 12 4a1.5 1.5 0 0 0-1.5 1.5V11l-8 4.5V17l8-2.5v5L8.5 21v1l3.5-1 3.5 1v-1l-2-1.5v-5l8 2.5v-1.5Z"/>' +
+      "</svg>";
     miniBtn.title = "Torn Travel Planner — tap to open (drag to move)";
     // tap to expand (unless it was a drag)
     let miniDragged = false;
