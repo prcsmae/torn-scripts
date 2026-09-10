@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Travel Planner
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  Plan profitable travel routes using live abroad prices (YATA /api/v1/travel/export/) + Torn market values. Per-trip profit, budget allocation, suggested buy-list, active-window (short-haul) & sleep (long-haul) planning.
 // @author       motherBarker (and China)
 // @match        https://www.torn.com/travelagency.php*
@@ -2198,8 +2198,12 @@
     header.style.cssText =
       "display:flex;align-items:center;justify-content:space-between;padding:9px 14px;background:#161b22;border-bottom:1px solid #30363d;cursor:grab;user-select:none;";
     const title = document.createElement("span");
-    title.textContent = "Torn Travel Planner";
-    title.style.cssText = "font-weight:bold;font-size:15px;color:#58a6ff;";
+    title.style.cssText = "font-weight:bold;font-size:15px;color:#58a6ff;display:inline-flex;align-items:center;gap:7px;";
+    title.innerHTML =
+      '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">' +
+      '<path fill="currentColor" d="M21.5 15.5 13.5 11V5.5A1.5 1.5 0 0 0 12 4a1.5 1.5 0 0 0-1.5 1.5V11l-8 4.5V17l8-2.5v5L8.5 21v1l3.5-1 3.5 1v-1l-2-1.5v-5l8 2.5v-1.5Z"/>' +
+      "</svg>";
+    title.appendChild(document.createTextNode("Torn Travel Planner"));
     const btns = document.createElement("div");
     btns.style.cssText = "display:flex;gap:6px;";
     const minBtn = document.createElement("button");
