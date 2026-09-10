@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Travel Planner
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Plan profitable travel routes using live abroad prices (YATA /api/v1/travel/export/) + Torn market values. Per-trip profit, budget allocation, suggested buy-list, active-window (short-haul) & sleep (long-haul) planning.
 // @author       motherBarker (and China)
 // @match        https://www.torn.com/travelagency.php*
@@ -1713,23 +1713,23 @@
 
   // ========== RENDER ==========
   // ---- Tab switching ----
+  // Shared tab styling: the active tab gets accent colors + underline so the
+  // user always sees which view they're in.
+  function applyTabStyles() {
+    const base =
+      "padding:6px 16px;border:1px solid #30363d;border-bottom:none;border-radius:6px 6px 0 0;font-size:12px;font-weight:bold;cursor:pointer;";
+    const active =
+      base + "background:#0d1117;color:#58a6ff;border-color:#58a6ff #30363d #0d1117;box-shadow:inset 0 2px 0 #58a6ff;";
+    const idle = base + "background:#161b22;color:#9aa4b2;";
+    if (tabBtnPlanner) tabBtnPlanner.style.cssText = state.tab === "planner" ? active : idle;
+    if (tabBtnTracker) tabBtnTracker.style.cssText = state.tab === "tracker" ? active : idle;
+  }
   function setTab(tab) {
     state.tab = tab === "tracker" ? "tracker" : "planner";
     saveState();
     if (plannerWrap) plannerWrap.style.display = state.tab === "planner" ? "" : "none";
     if (trackerWrap) trackerWrap.style.display = state.tab === "tracker" ? "" : "none";
-    const on = "background:#0d1117;color:#58a6ff;";
-    const off = "background:#161b22;color:#9aa4b2;";
-    if (tabBtnPlanner)
-      tabBtnPlanner.style.cssText = tabBtnPlanner.style.cssText.replace(
-        /background:[^;]+;color:[^;]+;/,
-        state.tab === "planner" ? on : off,
-      );
-    if (tabBtnTracker)
-      tabBtnTracker.style.cssText = tabBtnTracker.style.cssText.replace(
-        /background:[^;]+;color:[^;]+;/,
-        state.tab === "tracker" ? on : off,
-      );
+    applyTabStyles();
     if (state.tab === "tracker") {
       updateItemOptions();
       buildTracker();
@@ -2516,6 +2516,7 @@
     tabBtnTracker = tabBtn("Item tracker", "tracker");
     tabBar.appendChild(tabBtnPlanner);
     tabBar.appendChild(tabBtnTracker);
+    applyTabStyles();
 
     // Wrap everything that belongs to the planner view so tabs toggle one node.
     plannerWrap = document.createElement("div");
