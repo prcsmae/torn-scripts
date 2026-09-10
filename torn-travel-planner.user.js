@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Travel Planner
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Plan profitable travel routes using live abroad prices (YATA /api/v1/travel/export/) + Torn market values. Per-trip profit, budget allocation, suggested buy-list, active-window (short-haul) & sleep (long-haul) planning.
 // @author       motherBarker (and China)
 // @match        https://www.torn.com/travelagency.php*
@@ -118,6 +118,8 @@
     stockWindow: -1, // aim to land ~N min AFTER a restock (default -1 per playbook)
     nerveWasteLimit: 0, // max nerve you'll allow to cap while airborne before warning (0 = none)
     nerveCare: false, // whether the user cares about nerve waste at all
+    trackedItems: [], // item ids the user wants leave-times for (item tracker tab)
+    tab: "planner", // which tab is showing: planner | tracker
     apiKey: "", // user's own API key ('' = disabled); enables nerve/restock reads
     restockConfidence: "med", // only trust OOS-restock predictions at/above this ('high'|'med'|'low')
     activeStart: "", // HH:MM ('' = disabled)
@@ -144,6 +146,15 @@
         state.stockWindow = Number.isFinite(state.stockWindow) ? state.stockWindow : -1;
         state.nerveWasteLimit = Number.isFinite(state.nerveWasteLimit) ? state.nerveWasteLimit : 0;
         state.nerveCare = !!state.nerveCare;
+        // Single tracked item (v1.5) upgraded to a list; keep the old value.
+        if (state.trackItem) {
+          state.trackedItems = [parseInt(state.trackItem, 10)];
+          delete state.trackItem;
+        }
+        state.trackedItems = Array.isArray(state.trackedItems)
+          ? [...new Set(state.trackedItems.map((n) => parseInt(n, 10)).filter((n) => n > 0))]
+          : [];
+        if (state.tab !== "tracker") state.tab = "planner";
         if (!state.restockConfidence) state.restockConfidence = "med";
       }
       // Default the active-window start to "now" if nothing is saved.
@@ -1361,6 +1372,62 @@
     return computeSleepPlan(abroad, items, models);
   }
 
+  // ========== ITEM TRACKER ==========
+  // For each user-tracked item, work out when to LEAVE for every destination
+  // that stocks it so the item is freshly restocked (per the stock window) at
+  // arrival. Reuses departurePlan ("now" = go immediately, "timed" = leave at
+  // departAtMs) and re-checks the shelf at the planned arrival so the advice is
+  // honest: destinations where even the timed departure doesn't work out are
+  // dropped, and restock predictions below the confidence threshold are skipped.
+  function computeItemTimer(abroad, items, models) {
+    const nowMs = _ttpNow();
+    const groups = [];
+    for (const id of state.trackedItems) {
+      const it = items[id];
+      const rows = [];
+      for (const key of Object.keys(CONFIG.destinations)) {
+        const dc = CONFIG.destinations[key];
+        const oneWay = dc.time[state.mode] != null ? dc.time[state.mode] : dc.time.standard;
+        const stock = (abroad.stocks && abroad.stocks[key] && abroad.stocks[key].stocks) || [];
+        const s = stock.find((x) => x.id === id);
+        if (!s) continue;
+        const entry = models && models[key] ? models[key][s.id] : null;
+        const dep = departurePlan(s, entry, nowMs, oneWay, key, state.stockWindow);
+        if (!dep) continue; // no restock lands in a usable window
+        let ld = dep.ld || null;
+        if (dep.status === "timed") {
+          // Re-evaluate the shelf at the planned (future) arrival.
+          ld = landingAvailability(s, entry, nowMs, dep.landAtMs, state.stockWindow, key);
+        }
+        if (!ld || ld.status === "empty") continue;
+        if (
+          ld.status === "restock" &&
+          ld.conf &&
+          confRank(state.restockConfidence || "med") > confRank(ld.conf.level)
+        )
+          continue; // too speculative per the user's confidence setting
+        rows.push({
+          key,
+          name: dc.name,
+          city: dc.city,
+          oneWay,
+          unitNet:
+            it && parseFloat(it.market_value) > 0
+              ? parseFloat(it.market_value) * (state.netPct / 100) - s.cost
+              : null,
+          qtyNow: typeof s.quantity === "number" ? s.quantity : 0,
+          status: dep.status,
+          departAtMs: dep.departAtMs,
+          landAtMs: dep.landAtMs,
+          ld,
+        });
+      }
+      rows.sort((a, b) => a.departAtMs - b.departAtMs);
+      groups.push({ id, name: it ? it.name : "#" + id, rows });
+    }
+    return { groups, nowMs };
+  }
+
   // ========== RENDER STATE ==========
   let sortState = { key: null, dir: -1 }; // key from sortable columns; -1 desc
   // Panel element refs
@@ -1372,6 +1439,14 @@
     tableWrap = null; // eslint-disable-line no-unused-vars
   let miniButtonEl = null;
   let panelMinimized = false;
+  // Tab + item tracker refs
+  let plannerWrap = null,
+    trackerWrap = null,
+    trackResultsEl = null,
+    trackDatalistEl = null,
+    trackSearchInp = null,
+    tabBtnPlanner = null,
+    tabBtnTracker = null;
 
   // Column definitions for the sortable table
   const COLUMNS = [
@@ -1637,6 +1712,86 @@
   }
 
   // ========== RENDER ==========
+  // ---- Tab switching ----
+  function setTab(tab) {
+    state.tab = tab === "tracker" ? "tracker" : "planner";
+    saveState();
+    if (plannerWrap) plannerWrap.style.display = state.tab === "planner" ? "" : "none";
+    if (trackerWrap) trackerWrap.style.display = state.tab === "tracker" ? "" : "none";
+    const on = "background:#0d1117;color:#58a6ff;";
+    const off = "background:#161b22;color:#9aa4b2;";
+    if (tabBtnPlanner)
+      tabBtnPlanner.style.cssText = tabBtnPlanner.style.cssText.replace(
+        /background:[^;]+;color:[^;]+;/,
+        state.tab === "planner" ? on : off,
+      );
+    if (tabBtnTracker)
+      tabBtnTracker.style.cssText = tabBtnTracker.style.cssText.replace(
+        /background:[^;]+;color:[^;]+;/,
+        state.tab === "tracker" ? on : off,
+      );
+    if (state.tab === "tracker") {
+      updateItemOptions();
+      buildTracker();
+    }
+  }
+
+  // ---- Item tracker: add / remove / options / render ----
+  const MAX_TRACKED = 10;
+  function addTrackedItem(raw) {
+    if (!lastData || !trackSearchInp || !trackDatalistEl) return;
+    const q = String(raw || "").trim().toLowerCase();
+    if (!q) return;
+    // Exact id, else exact name, else first name containing the text.
+    let id = parseInt(q, 10);
+    if (!(id > 0 && lastData.items[id])) {
+      id = null;
+      for (const opt of trackDatalistEl.options) {
+        const [oid, nm] = opt.value.split("|");
+        if (nm.toLowerCase() === q) { id = parseInt(oid, 10); break; }
+      }
+      if (id == null) {
+        for (const opt of trackDatalistEl.options) {
+          const [oid, nm] = opt.value.split("|");
+          if (nm.toLowerCase().includes(q)) { id = parseInt(oid, 10); break; }
+        }
+      }
+    }
+    if (!(id > 0)) { trackSearchInp.value = ""; return; }
+    if (!state.trackedItems.includes(id) && state.trackedItems.length < MAX_TRACKED)
+      state.trackedItems.push(id);
+    trackSearchInp.value = "";
+    saveState();
+    buildTracker();
+  }
+  function removeTrackedItem(id) {
+    state.trackedItems = state.trackedItems.filter((n) => n !== id);
+    saveState();
+    buildTracker();
+  }
+  // Rebuild the datalist from current abroad data (id|name pairs).
+  function updateItemOptions() {
+    if (!trackDatalistEl || !lastData) return;
+    trackDatalistEl.innerHTML = "";
+    const byId = new Map();
+    for (const key of Object.keys(CONFIG.destinations)) {
+      const stock =
+        (lastData.abroad.stocks && lastData.abroad.stocks[key] && lastData.abroad.stocks[key].stocks) || [];
+      for (const s of stock) {
+        const it = lastData.items[s.id];
+        if (!it || it.tradeable === false) continue;
+        if (!byId.has(s.id)) byId.set(s.id, { name: it.name || "#" + s.id, dests: 0 });
+        byId.get(s.id).dests++;
+      }
+    }
+    for (const [id, v] of [...byId.entries()].sort((a, b) => a[1].name.localeCompare(b[1].name))) {
+      const o = document.createElement("option");
+      o.value = id + "|" + v.name;
+      o.label = v.name + (v.dests > 1 ? ` (${v.dests} dest)` : "");
+      trackDatalistEl.appendChild(o);
+    }
+  }
+
   function renderResults() {
     if (!lastData) {
       if (statusEl) statusEl.textContent = "No data yet — click Refresh.";
@@ -1658,8 +1813,81 @@
     const sleep = sleepRecommendation(lastData.abroad, lastData.items, lastData.model || {});
     buildSummary(computed, sleep, lastData.nerve);
     buildTable(computed);
+    updateItemOptions();
+    buildTracker();
     updateStatus();
     if (statusEl) statusEl.style.color = "#bbb";
+  }
+
+  function buildTracker() {
+    if (!trackResultsEl) return;
+    // Chips (tracked items)
+    const chips = document.getElementById("ttp-track-chips");
+    if (chips) {
+      chips.innerHTML = "";
+      if (!state.trackedItems.length) {
+        const hint = document.createElement("span");
+        hint.style.cssText = "color:#9aa4b2;font-size:12px;";
+        hint.textContent = "Nothing tracked yet — search an item above and hit Track.";
+        chips.appendChild(hint);
+      }
+      for (const id of state.trackedItems) {
+        const chip = document.createElement("span");
+        chip.style.cssText =
+          "display:inline-flex;align-items:center;gap:5px;background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2px 8px;font-size:11px;";
+        const it = lastData && lastData.items[id];
+        const nm = document.createElement("span");
+        nm.textContent = it ? it.name : "#" + id;
+        chip.appendChild(nm);
+        const x = document.createElement("button");
+        x.textContent = "×";
+        x.title = "Stop tracking";
+        x.style.cssText =
+          "background:none;border:none;color:#f85149;font-size:13px;cursor:pointer;padding:0;line-height:1;";
+        x.addEventListener("click", () => removeTrackedItem(id));
+        chip.appendChild(x);
+        chips.appendChild(chip);
+      }
+    }
+    // Results
+    if (!lastData) {
+      trackResultsEl.innerHTML =
+        '<div style="color:#9aa4b2;font-size:12px;">Click Refresh to load stock data first.</div>';
+      return;
+    }
+    if (!state.trackedItems.length) {
+      trackResultsEl.innerHTML = "";
+      return;
+    }
+    const t = computeItemTimer(lastData.abroad, lastData.items, lastData.model || {});
+    let html = "";
+    for (const g of t.groups) {
+      html += `<div style="margin-bottom:10px;">`;
+      html += `<div style="font-weight:bold;color:#58a6ff;font-size:13px;">${g.name}</div>`;
+      if (!g.rows.length) {
+        html += `<div style="color:#9aa4b2;font-size:12px;">No usable restock window at any destination with your stock window + confidence settings.</div>`;
+      }
+      for (const r of g.rows) {
+        const qty = r.ld && r.ld.qty != null ? r.ld.qty : "?";
+        const conf =
+          r.ld && r.ld.conf && r.ld.conf.level !== "high"
+            ? ` · <span style="color:#d29922;">${r.ld.conf.label} confidence</span>`
+            : "";
+        const after =
+          r.ld && r.ld.beforeLanding != null ? ` · ${Math.max(0, r.ld.beforeLanding)}m after restock` : "";
+        const when =
+          r.status === "now"
+            ? `Leave <b>now</b> — land in ${hours(r.oneWay)}`
+            : `Leave in <b>${hours(Math.max(0, (r.departAtMs - t.nowMs) / 60000))}</b> (at ${localHHMM(r.departAtMs)})`;
+        const net =
+          r.unitNet != null
+            ? ` · <span style="color:${colorFor(r.unitNet)};">${signed(r.unitNet)}/unit</span>`
+            : "";
+        html += `<div style="font-size:12px;margin-top:3px;"><b>${r.name}</b> — ${when} · ~${qty} on shelf${after}${net}${conf}</div>`;
+      }
+      html += `</div>`;
+    }
+    trackResultsEl.innerHTML = html;
   }
 
   function updateStatus() {
@@ -1865,6 +2093,7 @@
     ["Stock window (min)", "Land ~N minutes AFTER a restock. Negative (default) = land as soon as possible after the restock. Restocks older than this window before landing are treated as already sold out."],
     ["Restock confidence", "Minimum trust level for restock predictions (live PromBot data / restock model). Lower = more speculative routes shown."],
     ["Nerve waste", "Tick the box if you care about nerve capping mid-flight. When on, warns if the round trip wastes more than N nerve and suggests how much to spend first."],
+    ["Item tracker (tab)", "Track up to 10 specific items and get exact leave-times: for each destination stocking the item, when to depart so it's freshly restocked (per your stock window) at arrival, with expected shelf size and net per unit."],
     ["API key", "Optional Torn API key (items + nerve). Needed for the nerve-waste estimate; stored locally in your browser only."],
     ["Auto-refresh", "Re-fetch live prices and restock data every 10 minutes."],
   ];
@@ -1876,6 +2105,7 @@
     ["Read the stock badges", "IN STOCK = on the shelf when you land. RESTOCKS = item refills near your arrival (timing shown). EMPTY / GONE = don't bother — it won't be there."],
     ["Optional: sleep plan", "Enter your sleep hours and the planner times a departure so the best item is freshly restocked exactly when you wake up."],
     ["Optional: nerve + API key", "Tick Nerve waste and add an API key to get a warning when a round trip would waste nerve, plus how much to spend before flying."],
+    ["Optional: item tracker", "Switch to the Item tracker tab, search for items you're hunting, and it tells you exactly when to leave for each destination so they're freshly restocked when you land."],
   ];
   function showHelp() {
     const old = document.getElementById("ttp-help");
@@ -1983,10 +2213,10 @@
     });
     const helpBtn = document.createElement("button");
     helpBtn.className = "ttp-helpbtn";
-    helpBtn.textContent = "Help";
+    helpBtn.textContent = "?";
     helpBtn.title = "How to use the travel planner";
     helpBtn.style.cssText =
-      "background:#1f6feb;color:#fff;border:none;border-radius:4px;font-size:11px;font-weight:bold;padding:3px 10px;cursor:pointer;";
+      "background:#21262d;color:#e6edf3;border:1px solid #6e7681;border-radius:50%;width:22px;height:22px;font-size:13px;font-weight:bold;line-height:1;padding:0;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;";
     helpBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       showHelp();
@@ -2267,6 +2497,65 @@
     tw.innerHTML = '<div style="color:#aaa;">Click <b>Refresh</b> to fetch live prices.</div>';
     body.appendChild(tw);
 
+    // ---- Tabs: keep the planner uncluttered; item tracking gets its own view ----
+    const tabBar = document.createElement("div");
+    tabBar.style.cssText = "display:flex;gap:6px;padding:8px 14px 0;";
+    function tabBtn(label, key) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.style.cssText =
+        "padding:5px 14px;border:1px solid #30363d;border-bottom:none;border-radius:6px 6px 0 0;background:#161b22;color:#9aa4b2;font-size:12px;font-weight:bold;cursor:pointer;";
+      b.addEventListener("click", () => setTab(key));
+      return b;
+    }
+    tabBtnPlanner = tabBtn("Planner", "planner");
+    tabBtnTracker = tabBtn("Item tracker", "tracker");
+    tabBar.appendChild(tabBtnPlanner);
+    tabBar.appendChild(tabBtnTracker);
+
+    // Wrap everything that belongs to the planner view so tabs toggle one node.
+    plannerWrap = document.createElement("div");
+    while (body.firstChild) plannerWrap.appendChild(body.firstChild);
+    body.appendChild(tabBar);
+    body.appendChild(plannerWrap);
+
+    // Tracker view: item search + tracked list + leave-times.
+    trackerWrap = document.createElement("div");
+    trackerWrap.style.display = "none";
+    trackerWrap.style.cssText = "padding:10px 14px;";
+    const trackRow = document.createElement("div");
+    trackRow.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+    trackSearchInp = document.createElement("input");
+    trackSearchInp.className = "ttp-input";
+    trackSearchInp.placeholder = "Search item to track…";
+    trackSearchInp.style.cssText = "flex:1;min-width:180px;";
+    trackSearchInp.setAttribute("list", "ttp-items-dl");
+    trackDatalistEl = document.createElement("datalist");
+    trackDatalistEl.id = "ttp-items-dl";
+    const addBtn = document.createElement("button");
+    addBtn.textContent = "Track";
+    addBtn.title = "Add this item to the tracker";
+    addBtn.style.cssText =
+      "padding:5px 12px;background:#238636;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;";
+    addBtn.addEventListener("click", () => addTrackedItem(trackSearchInp.value));
+    trackSearchInp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") addTrackedItem(trackSearchInp.value);
+    });
+    trackRow.appendChild(trackSearchInp);
+    trackRow.appendChild(trackDatalistEl);
+    trackRow.appendChild(addBtn);
+    trackerWrap.appendChild(trackRow);
+    const trackChips = document.createElement("div");
+    trackChips.id = "ttp-track-chips";
+    trackChips.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;";
+    trackerWrap.appendChild(trackChips);
+    trackResultsEl = document.createElement("div");
+    trackResultsEl.style.cssText = "margin-top:10px;";
+    trackerWrap.appendChild(trackResultsEl);
+    body.appendChild(trackerWrap);
+
+    setTab(state.tab === "tracker" ? "tracker" : "planner");
+
     container.appendChild(body);
     document.body.appendChild(container);
 
@@ -2394,6 +2683,10 @@
     feedTimer = setInterval(() => {
       if (state.autoRefresh) loadData();
     }, 60000);
+    // Keep tracker countdowns fresh every minute even without new data.
+    setInterval(() => {
+      if (!panelMinimized && state.tab === "tracker" && lastData) buildTracker();
+    }, 60000);
   }
   function scheduleStatusTicker() {
     // Live "Data Xs old" counter — ticks the age every second so it's never frozen.
@@ -2443,6 +2736,7 @@
       nerveInfo,
       computeDestinations,
       computeSleepPlan,
+      computeItemTimer,
       RESTOCK_CUSHION_MIN,
       POST_ARRIVAL_MINS,
       SELL_SAFETY,
