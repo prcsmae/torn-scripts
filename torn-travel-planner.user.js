@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Travel Planner
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Plan profitable travel routes using live abroad prices (YATA /api/v1/travel/export/) + Torn market values. Per-trip profit, budget allocation, suggested buy-list, active-window (short-haul) & sleep (long-haul) planning.
 // @author       motherBarker (and China)
 // @match        https://www.torn.com/travelagency.php*
@@ -117,6 +117,7 @@
     respectStock: true, // only buy items that will be in stock when you land
     stockWindow: -1, // aim to land ~N min AFTER a restock (default -1 per playbook)
     nerveWasteLimit: 0, // max nerve you'll allow to cap while airborne before warning (0 = none)
+    nerveCare: false, // whether the user cares about nerve waste at all
     apiKey: "", // user's own API key ('' = disabled); enables nerve/restock reads
     restockConfidence: "med", // only trust OOS-restock predictions at/above this ('high'|'med'|'low')
     activeStart: "", // HH:MM ('' = disabled)
@@ -142,6 +143,7 @@
         if (state.respectStock == null) state.respectStock = true;
         state.stockWindow = Number.isFinite(state.stockWindow) ? state.stockWindow : -1;
         state.nerveWasteLimit = Number.isFinite(state.nerveWasteLimit) ? state.nerveWasteLimit : 0;
+        state.nerveCare = !!state.nerveCare;
         if (!state.restockConfidence) state.restockConfidence = "med";
       }
       // Default the active-window start to "now" if nothing is saved.
@@ -589,6 +591,14 @@
     };
   }
   const RESTOCK_CUSHION_MIN = 3; // minutes of safety on top of stockWindow, so a bumpy restock estimate still shelves before you land
+  const RESTOCK_FRESH_GRACE_MIN = 10; // default "land right after a restock" tolerance when the stock window is negative
+  // A restock older than this (relative to landing) is treated as already sold
+  // out: 90+ minutes of buyers picking the shelf clean is not a landing plan,
+  // even if a naive sell-rate extrapolation still "predicts survivors".
+  function restockGraceMs(stockWindowMin) {
+    const w = Number(stockWindowMin) || 0;
+    return ((w > 0 ? w : RESTOCK_FRESH_GRACE_MIN) + RESTOCK_CUSHION_MIN) * 60000;
+  }
   // Predicted minutes until an in-stock item sells out, from the model's sellRate
   // (mirrors foreign-stock: buffered so we err toward 'sells out sooner').
   const SELL_SAFETY = 1.15;
@@ -648,6 +658,21 @@
         // In stock now, but likely sold out before you finish buying.
         if (state.respectStock) {
           const nrMs = itemNextRestockMs(s, entry, nowMs);
+          const graceMs = restockGraceMs(stockWindowMin);
+          if (nrMs != null && nrMs <= arrivalMs && arrivalMs - nrMs > graceMs) {
+            // Restock happens long before landing — its fresh stock will be
+            // gone by the time you arrive (stock window says land ~N min after
+            // a restock, not 95 minutes after one).
+            return {
+              status: "empty",
+              qty: 0,
+              note:
+                "restocks " +
+                Math.max(1, Math.round((arrivalMs - nrMs) / 60000)) +
+                "m before you land — won't still be stocked",
+              conf,
+            };
+          }
           if (nrMs != null && nrMs <= arrivalMs) {
             const survived = restockSurvival(
               modelRestockQty(entry) || qty,
@@ -749,10 +774,17 @@
     }
     const nrMs = src ? src.nextMs : null;
     const byMs = arrivalMs + (stockWindowMin || 0) * 60000 - RESTOCK_CUSHION_MIN * 60000;
+    const graceMs = restockGraceMs(stockWindowMin);
     // Only claim "restocked before you land" when the restock truly precedes
-    // arrival; a positive stockWindow can push byMs past arrival, and restocks
-    // after landing belong to the post-arrival wait path below.
-    if (nrMs != null && nrMs <= byMs && nrMs <= arrivalMs) {
+    // arrival AND is fresh enough to still be on the shelf (stock window); a
+    // positive stockWindow can push byMs past arrival, and restocks after
+    // landing belong to the post-arrival wait path below.
+    if (
+      nrMs != null &&
+      nrMs <= byMs &&
+      nrMs <= arrivalMs &&
+      arrivalMs - nrMs <= graceMs
+    ) {
       const survived = restockSurvival(
         modelRestockQty(entry) || state.capacity * 3,
         entry && entry.sellRate,
@@ -776,6 +808,17 @@
           "restocks " +
           Math.max(1, Math.round((arrivalMs - nrMs) / 60000)) +
           "m before you land but sells out again",
+        conf,
+      };
+    }
+    if (nrMs != null && nrMs <= arrivalMs && arrivalMs - nrMs > graceMs) {
+      return {
+        status: "empty",
+        qty: 0,
+        note:
+          "restocks " +
+          Math.max(1, Math.round((arrivalMs - nrMs) / 60000)) +
+          "m before you land — won't still be stocked",
         conf,
       };
     }
@@ -1420,7 +1463,7 @@
       }
       if (best && best.nerve && typeof best.nerve.now === "number") {
         const n = best.nerve;
-        if (n.waste > state.nerveWasteLimit) {
+        if (state.nerveCare && n.waste > state.nerveWasteLimit) {
           const doSpend = Math.max(0, n.waste - state.nerveWasteLimit);
           html += `<div style="color:#e2a03f;font-size:12px;margin-top:4px;">🧠 Nerve ${n.now}/${n.max} — this RT wastes <b>~${n.waste}</b> nerve. Spend <b>${doSpend}</b> (down to ~${n.spendTo}) before leaving to avoid capping mid-flight.</div>`;
         }
@@ -1704,26 +1747,167 @@
   // ========== BUILD PANEL (large overlay) ==========
   function field(label, input, extra) {
     const wrap = document.createElement("div");
-    wrap.style.cssText = "display:flex;flex-direction:column;gap:2px;" + (extra || "");
+    wrap.style.cssText = "display:flex;flex-direction:column;gap:3px;" + (extra || "");
     const lab = document.createElement("label");
     lab.textContent = label;
-    lab.style.cssText = "color:#999;font-size:11px;";
+    lab.className = "ttp-label";
+    const err = document.createElement("div");
+    err.className = "ttp-err";
+    err.style.display = "none";
     wrap.appendChild(lab);
     wrap.appendChild(input);
+    wrap.appendChild(err);
+    // Inputs report problems through this — shown inline under the field.
+    input.__setErr = (msg) => {
+      if (msg) {
+        err.textContent = msg;
+        err.style.display = "block";
+        input.classList.add("ttp-bad");
+      } else {
+        err.textContent = "";
+        err.style.display = "none";
+        input.classList.remove("ttp-bad");
+      }
+    };
     return wrap;
   }
-  function numInput(value, min, step, onchange, w) {
+  function numInput(value, min, step, onchange, w, opts) {
     const inp = document.createElement("input");
     inp.type = "number";
+    inp.className = "ttp-input";
     inp.min = min != null ? min : "";
     inp.step = step || 1;
     inp.value = value;
-    inp.style.cssText =
-      "background:#0f0f0f;border:1px solid #30363d;color:#fff;border-radius:3px;padding:3px 6px;font-size:12px;width:" +
-      (w || "70px") +
-      ";";
-    inp.addEventListener("change", () => onchange(parseFloat(inp.value)));
+    inp.style.width = w || "70px";
+    if (opts && opts.title) inp.title = opts.title;
+    let lastValid = typeof value === "number" && isFinite(value) ? value : null;
+    const check = () => {
+      const raw = parseFloat(inp.value);
+      if (inp.value === "" || isNaN(raw)) return { err: "Enter a number" };
+      if (min != null && raw < min) return { err: "Min " + min };
+      if (opts && opts.max != null && raw > opts.max) return { err: "Max " + opts.max };
+      if (opts && opts.integer && Math.floor(raw) !== raw) return { err: "Whole numbers only" };
+      return { v: raw };
+    };
+    // Responsive: validate as the user types, commit (and save) on change.
+    inp.addEventListener("input", () => {
+      const r = check();
+      if (inp.__setErr) inp.__setErr(r.err || null);
+    });
+    inp.addEventListener("change", () => {
+      const r = check();
+      if (r.err) {
+        if (inp.__setErr) inp.__setErr(r.err);
+        inp.value = lastValid != null ? lastValid : ""; // revert invalid input
+        return;
+      }
+      if (inp.__setErr) inp.__setErr(null);
+      lastValid = r.v;
+      onchange(r.v);
+    });
     return inp;
+  }
+  // Budget input: accepts short-hand (2k / 2m / 1.5b), commas while typing and
+  // plain numbers. Comma-formats on commit; invalid text shows an inline error
+  // and reverts to the last good value.
+  function parseMoney(raw) {
+    if (raw == null) return null;
+    const s = String(raw).trim().replace(/[,\s_]/g, "");
+    if (!s) return null;
+    const m = s.match(/^(\d+(?:\.\d+)?)([kmb])?$/i);
+    if (!m) return null;
+    const mult = m[2] ? { k: 1e3, m: 1e6, b: 1e9 }[m[2].toLowerCase()] : 1;
+    const v = Math.round(parseFloat(m[1]) * mult);
+    return isFinite(v) && v >= 0 ? v : null;
+  }
+  function moneyInput(value, onchange, w) {
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.className = "ttp-input";
+    inp.inputMode = "numeric";
+    inp.placeholder = "2m · 1,000,000";
+    inp.title = "Accepts 2k = 2,000, 2m = 2,000,000, 1.5b = 1,500,000,000, commas and plain numbers";
+    inp.value = value != null && isFinite(Number(value)) ? Number(value).toLocaleString("en-US") : "";
+    inp.style.width = w || "110px";
+    let lastValid = typeof value === "number" && isFinite(value) ? value : null;
+    const fmt = (v) => (v == null ? "" : v.toLocaleString("en-US"));
+    inp.addEventListener("input", () => {
+      if (inp.value.trim() === "") {
+        if (inp.__setErr) inp.__setErr("Enter an amount (e.g. 2m or 2,000,000)");
+        return;
+      }
+      const v = parseMoney(inp.value);
+      if (inp.__setErr)
+        inp.__setErr(v == null ? "Use 2m = 2,000,000, 2k = 2,000, commas, or a plain number" : null);
+    });
+    inp.addEventListener("change", () => {
+      const v = parseMoney(inp.value);
+      if (v == null) {
+        inp.value = fmt(lastValid); // revert invalid input
+        if (inp.__setErr) inp.__setErr(null);
+        return;
+      }
+      lastValid = v;
+      inp.value = fmt(v);
+      if (inp.__setErr) inp.__setErr(null);
+      onchange(v);
+    });
+    return inp;
+  }
+  // "?" header button → modal explaining every control.
+  const HELP_ITEMS = [
+    ["Travel method", "Flight class. Airstrip / WLT / Business are FREE and faster; only Standard pays the fare shown per destination."],
+    ["Item capacity", "How many items you can carry home in one trip."],
+    ["Net % (trade)", "Percent of market value you actually receive when selling. 97 is typical."],
+    ["Budget (capital)", "Money you're willing to spend per trip. Short-hand works: 2m = 2,000,000, 2k = 2,000, 1.5b = 1,500,000,000. Commas are fine."],
+    ["Buy buffer (min)", "Minutes you'll realistically spend shopping after landing. Items predicted to sell out before you finish buying are skipped."],
+    ["Active start / end", "Your awake window. Departure times and active-window recommendations target this period; 'Now' sets start to the current time."],
+    ["Sleep (h)", "Hours you'll be asleep — the sleep plan times a departure so the best item is freshly restocked when you wake up."],
+    ["Stock on arrival", "Only recommend items that will actually be on the shelf when you land (respects depletion + restock timing)."],
+    ["Stock window (min)", "Land ~N minutes AFTER a restock. Negative (default) = land as soon as possible after the restock. Restocks older than this window before landing are treated as already sold out."],
+    ["Restock confidence", "Minimum trust level for restock predictions (live PromBot data / restock model). Lower = more speculative routes shown."],
+    ["Nerve waste", "Tick the box if you care about nerve capping mid-flight. When on, warns if the round trip wastes more than N nerve and suggests how much to spend first."],
+    ["API key", "Optional Torn API key (items + nerve). Needed for the nerve-waste estimate; stored locally in your browser only."],
+    ["Auto-refresh", "Re-fetch live prices and restock data every 10 minutes."],
+  ];
+  function showHelp() {
+    const old = document.getElementById("ttp-help");
+    if (old) {
+      old.remove();
+      return;
+    }
+    const ov = document.createElement("div");
+    ov.id = "ttp-help";
+    ov.className = "ttp-help-ov";
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov) ov.remove();
+    });
+    const card = document.createElement("div");
+    card.className = "ttp-help-card";
+    const h = document.createElement("h3");
+    h.textContent = "✈️ Travel Planner — settings guide";
+    const close = document.createElement("button");
+    close.className = "ttp-input";
+    close.textContent = "Close";
+    close.style.cssText = "margin-top:10px;cursor:pointer;";
+    close.addEventListener("click", () => ov.remove());
+    for (const [k, d] of HELP_ITEMS) {
+      const row = document.createElement("div");
+      row.className = "h-row";
+      const key = document.createElement("span");
+      key.className = "h-k";
+      key.textContent = k + " — ";
+      const desc = document.createElement("span");
+      desc.className = "h-d";
+      desc.textContent = d;
+      row.appendChild(key);
+      row.appendChild(desc);
+      card.appendChild(row);
+    }
+    card.appendChild(h);
+    card.appendChild(close);
+    ov.appendChild(card);
+    document.body.appendChild(ov);
   }
 
   function buildPanel() {
@@ -1766,6 +1950,16 @@
       e.stopPropagation();
       setMinimized(!panelMinimized);
     });
+    const helpBtn = document.createElement("button");
+    helpBtn.className = "ttp-min";
+    helpBtn.textContent = "?";
+    helpBtn.title = "What each setting does";
+    helpBtn.style.cssText = btnStyle();
+    helpBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showHelp();
+    });
+    btns.appendChild(helpBtn);
     btns.appendChild(minBtn);
     header.appendChild(title);
     header.appendChild(btns);
@@ -1813,7 +2007,7 @@
       modeSel.appendChild(o);
     });
     modeSel.value = state.mode;
-    modeSel.style.cssText = selStyle();
+    modeSel.className = "ttp-sel";
     modeSel.addEventListener("change", () => {
       state.mode = modeSel.value;
       if (!state.capacityOverridden) {
@@ -1833,6 +2027,7 @@
         onSettingsChange();
       },
       "60px",
+      { max: 10000, integer: true, title: "Items you can carry home in one trip" },
     );
     const netInp = numInput(
       state.netPct,
@@ -1843,17 +2038,12 @@
         onSettingsChange();
       },
       "60px",
+      { max: 100, title: "Percent of market value you actually receive when selling" },
     );
-    const budInp = numInput(
-      state.budget,
-      0,
-      1000,
-      (v) => {
-        state.budget = v;
-        onSettingsChange();
-      },
-      "100px",
-    );
+    const budInp = moneyInput(state.budget, (v) => {
+      state.budget = v;
+      onSettingsChange();
+    }, "110px");
     const bufInp = numInput(
       state.bufferMin,
       0,
@@ -1863,6 +2053,7 @@
         onSettingsChange();
       },
       "55px",
+      { max: 240, integer: true, title: "Minutes you'll spend buying after you land" },
     );
     const sleepInp = numInput(
       state.sleepHours,
@@ -1873,12 +2064,14 @@
         onSettingsChange();
       },
       "55px",
+      { max: 24, title: "Hours you'll be asleep before returning" },
     );
 
     const startInp = document.createElement("input");
     startInp.type = "time";
+    startInp.className = "ttp-input";
+    startInp.title = "When you're normally awake and flying";
     startInp.value = state.activeStart;
-    startInp.style.cssText = inputStyle();
     startInp.style.width = "90px";
     startInp.addEventListener("change", () => {
       state.activeStart = startInp.value;
@@ -1901,8 +2094,9 @@
     startWrap.appendChild(nowBtn);
     const endInp = document.createElement("input");
     endInp.type = "time";
+    endInp.className = "ttp-input";
+    endInp.title = "When you normally go to sleep";
     endInp.value = state.activeEnd;
-    endInp.style.cssText = inputStyle();
     endInp.style.width = "90px";
     endInp.addEventListener("change", () => {
       state.activeEnd = endInp.value;
@@ -1911,8 +2105,9 @@
 
     const respectCb = document.createElement("input");
     respectCb.type = "checkbox";
+    respectCb.className = "ttp-cb";
+    respectCb.title = "Only buy items that will actually be in stock when you land";
     respectCb.checked = state.respectStock;
-    respectCb.style.cssText = "cursor:pointer;";
     respectCb.addEventListener("change", () => {
       state.respectStock = respectCb.checked;
       onSettingsChange();
@@ -1926,6 +2121,7 @@
         onSettingsChange();
       },
       "50px",
+      { max: 2880, integer: true, title: "Land ~N min after a restock (negative = as soon as possible)" },
     );
     const nwInp = numInput(
       state.nerveWasteLimit,
@@ -1936,12 +2132,33 @@
         onSettingsChange();
       },
       "50px",
+      { max: 1000, integer: true, title: "Warn when the round trip wastes more than this much nerve" },
     );
+    // Nerve waste only matters when the user says so — the checkbox gates it.
+    const nerveCb = document.createElement("input");
+    nerveCb.type = "checkbox";
+    nerveCb.className = "ttp-cb";
+    nerveCb.checked = !!state.nerveCare;
+    nerveCb.title = "Care about nerve capping while you're in the air";
+    const nwRow = document.createElement("div");
+    nwRow.style.cssText = "display:flex;gap:5px;align-items:center;";
+    nwRow.appendChild(nerveCb);
+    nwRow.appendChild(nwInp);
+    nerveCb.addEventListener("change", () => {
+      state.nerveCare = nerveCb.checked;
+      nwInp.disabled = !nerveCb.checked;
+      nwInp.style.opacity = nerveCb.checked ? "1" : "0.45";
+      onSettingsChange();
+    });
+    if (!state.nerveCare) {
+      nwInp.disabled = true;
+      nwInp.style.opacity = "0.45";
+    }
     const keyInp = document.createElement("input");
     keyInp.type = "password";
     keyInp.placeholder = "API key (items + nerve)";
     keyInp.value = state.apiKey || "";
-    keyInp.style.cssText = inputStyle();
+    keyInp.className = "ttp-input";
     keyInp.style.width = "120px";
     keyInp.addEventListener("change", () => {
       state.apiKey = keyInp.value.trim();
@@ -1956,7 +2173,7 @@
       confSel.appendChild(o);
     });
     confSel.value = state.restockConfidence || "med";
-    confSel.style.cssText = selStyle();
+    confSel.className = "ttp-sel";
     confSel.addEventListener("change", () => {
       state.restockConfidence = confSel.value;
       onSettingsChange();
@@ -1964,8 +2181,9 @@
 
     const autoCb = document.createElement("input");
     autoCb.type = "checkbox";
+    autoCb.className = "ttp-cb";
+    autoCb.title = "Re-fetch live prices and restock data every 10 minutes";
     autoCb.checked = state.autoRefresh;
-    autoCb.style.cssText = "cursor:pointer;";
     autoCb.addEventListener("change", () => {
       state.autoRefresh = autoCb.checked;
       saveState();
@@ -1988,7 +2206,7 @@
     ctl.appendChild(field("Stock on arrival", respectCb, "justify-content:flex-end;"));
     ctl.appendChild(field("Stock window (min)", swInp));
     ctl.appendChild(field("Restock confidence", confSel));
-    ctl.appendChild(field("Nerve waste allow", nwInp));
+    ctl.appendChild(field("Nerve waste", nwRow));
     ctl.appendChild(field("API key", keyInp, "flex-basis:160px;"));
     ctl.appendChild(field("Auto-refresh", autoCb, "justify-content:flex-end;"));
     ctl.appendChild(refreshBtn);
@@ -2096,18 +2314,26 @@
       "@media (max-width:520px){" +
       "#ttp-root th[data-key=\"windowProfit\"],#ttp-root td:nth-child(5)," +
       "#ttp-root th[data-key=\"budgetSpent\"],#ttp-root td:nth-child(6){display:none;}" +
-      "#ttp-root .ttp-table{display:block;overflow-x:auto;white-space:nowrap;}}";
+      "#ttp-root .ttp-table{display:block;overflow-x:auto;white-space:nowrap;}}" +
+      "#ttp-root .ttp-label{color:#9aa4b2;font-size:10px;text-transform:uppercase;letter-spacing:.4px;font-weight:600;} " +
+      "#ttp-root .ttp-err{color:#f85149;font-size:10px;line-height:1.25;} " +
+      "#ttp-root .ttp-input,#ttp-root .ttp-sel{background:#0b0f14;border:1px solid #30363d;color:#e6edf3;border-radius:5px;padding:4px 8px;font-size:12px;transition:border-color .15s,box-shadow .15s;} " +
+      "#ttp-root .ttp-input:hover,#ttp-root .ttp-sel:hover{border-color:#4d5763;} " +
+      "#ttp-root .ttp-input:focus,#ttp-root .ttp-sel:focus{border-color:#58a6ff;outline:none;box-shadow:0 0 0 2px rgba(88,166,255,.25);} " +
+      "#ttp-root .ttp-input.ttp-bad,#ttp-root .ttp-sel.ttp-bad{border-color:#f85149;background:rgba(248,81,73,.07);} " +
+      "#ttp-root .ttp-input:disabled{opacity:.45;} " +
+      "#ttp-root .ttp-cb{width:14px;height:14px;accent-color:#238636;cursor:pointer;} " +
+      "#ttp-help{position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;font-family:Arial,sans-serif;}" +
+      "#ttp-help .ttp-help-card{background:#161b22;border:1px solid #30363d;border-radius:10px;max-width:640px;width:92vw;max-height:80vh;overflow-y:auto;padding:16px 20px;box-shadow:0 8px 30px rgba(0,0,0,.8);color:#e6edf3;font-size:12px;}" +
+      "#ttp-help h3{margin:0 0 12px;color:#58a6ff;font-size:14px;}" +
+      "#ttp-help .h-row{margin-bottom:8px;line-height:1.45;}" +
+      "#ttp-help .h-k{color:#e6edf3;font-weight:700;}" +
+      "#ttp-help .h-d{color:#9aa4b2;}";
     document.head.appendChild(st);
   }
 
   function btnStyle() {
     return "background:none;border:none;color:#aaa;font-size:15px;cursor:pointer;padding:0 6px;line-height:1;";
-  }
-  function selStyle() {
-    return "background:#0f0f0f;border:1px solid #30363d;color:#fff;border-radius:3px;padding:3px 6px;font-size:12px;";
-  }
-  function inputStyle() {
-    return "background:#0f0f0f;border:1px solid #30363d;color:#fff;border-radius:3px;padding:3px 6px;font-size:12px;";
   }
 
   function setMinimized(min) {
