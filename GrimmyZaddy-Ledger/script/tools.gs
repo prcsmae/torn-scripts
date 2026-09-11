@@ -78,7 +78,7 @@ function diagnoseSync() {
     return;
   }
 
-  MONEY_CATS.forEach(function (cat) {
+  moneyCategoryIds_().forEach(function (cat) {
     try {
       var j = fetchJson_(API + '/user/log?key=' + key_() + '&cat=' + cat + '&limit=1');
       var log = j.log || [];

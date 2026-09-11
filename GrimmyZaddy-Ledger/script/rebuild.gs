@@ -27,7 +27,26 @@ function rebuild() {
 
   raw.forEach(function (r) {
     var t = types[r.logType];
-    if (!t || t.direction === 'ignore') return;
+    if (!t || t.direction === 'ignore') {
+      // Safety net (mirrors TornCashflow's uncategorized panel): a log in a
+      // money category that nothing accounts for, whose data carries a cash
+      // field, is surfaced instead of silently dropped — Torn adds log types
+      // over time and this is the only way they announce themselves. Types
+      // the reference deliberately ignores (8166 arrest carries SOMEONE
+      // ELSE's bounty money, 5521's amount is a share count, item custody
+      // changes) are exempt.
+      var ref = REFERENCE_LOGMAP[r.logType];
+      if (ref && ref.d === 'ignore') return;
+      if (MONEY_CAT_NAME_SET[r.category]) {
+        var probe = firstKey_(parseRaw_(r), MONEY_KEYS);
+        if (probe !== null && num_(probe) !== 0) {
+          flag_(r, 'Unmapped money log in category "' + r.category +
+            '" — it carries a cash field but nothing accounts for it. Set ' +
+            'direction/money_key on LogTypeMap, or add it to REFERENCE_LOGMAP.');
+        }
+      }
+      return;
+    }
     if (!INCOME_DIRS[t.direction] && !EXPENSE_DIRS[t.direction]) return;
 
     var amount = moneyOf_(r, t);

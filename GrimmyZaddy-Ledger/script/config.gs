@@ -67,7 +67,16 @@ var QTY_KEYS   = ['quantity', 'qty', 'amount'];
 var DERIVED_MONEY_KEYS = {
   '8315': 'pot/2',
   '8314': 'pot',
-  '5511': 'worth-fees'
+  '5511': 'worth-fees',
+  // 6020 "Hunting session": one entry carries the session's cost AND income,
+  // so only the net is a real movement (verified: 22 of 84 real sessions
+  // profited — the net genuinely swings both ways).
+  '6020': 'income-cost',
+  // 5450 "Bank investment": worth is principal+interest, amount the
+  // principal. The interest is guaranteed, so it is recognized ONCE, when the
+  // investment is made; the withdraw (5451) returns principal + already-
+  // counted interest and is a pure transfer (see TRANSFER_TYPES).
+  '5450': 'worth-amount'
 };
 
 /**
@@ -82,6 +91,56 @@ var DERIVED_MONEY_KEYS = {
  * each category separately.
  */
 var MONEY_CATS = [14, 17, 138, 145];
+
+/**
+ * Additional log categories that move money but live OUTSIDE the four ids
+ * above. Verified against the TornCashflow mapping work: crime income
+ * (money_gained), muggings, hunting, missions, dividends, job/company
+ * specials, faction payday, property rent/upkeep/sales, bounties, and every
+ * casino game each log under their own category — none of them are reachable
+ * through 14/17/138/145, so a ledger that only walks those ids silently
+ * misses all of it.
+ *
+ * The names are resolved to category ids from /torn/logcategories at runtime
+ * (cached for 7 days in Script Properties — see moneyCategoryIds_()). A name
+ * that matches nothing is skipped harmlessly, so the list can safely include
+ * categories an account never touches.
+ */
+var EXTRA_MONEY_CAT_NAMES = [
+  'Crimes', 'Organized crimes', 'Missions', 'Racing', 'Travel', 'Bounties',
+  'Bail', 'Revive', 'Attacks', 'Property', 'Property rental', 'Upkeep',
+  'Estate agents', 'Company', 'Job', 'Stocks', 'City finds', 'Faction',
+  // Casino games: each of these categories carries bet/win log types.
+  'Casino', 'Slots', 'Roulette', 'High-low', 'Keno', 'Craps', 'Lottery',
+  'Blackjack', 'Spin the wheel', 'Russian roulette', 'Poker', 'Bookie',
+];
+
+/**
+ * The casino subset of EXTRA_MONEY_CAT_NAMES. Casino log types get one
+ * generic rule (mirroring TornCashflow's casinoNet): direction income with
+ * the net money_key 'won_amount?bet_amount' — a win logs won_amount AND
+ * bet_amount (net in), a loss only bet_amount (net out as a negative income
+ * row), so a losing streak never renders as wins and bets never inflate the
+ * Expenses tab. Covers every game, including high-low's pot cash-in, without
+ * per-game special cases.
+ */
+var CASINO_CAT_NAMES = [
+  'Casino', 'Slots', 'Roulette', 'High-low', 'Keno', 'Craps', 'Lottery',
+  'Blackjack', 'Spin the wheel', 'Russian roulette', 'Poker', 'Bookie',
+];
+
+/**
+ * Category NAMES that move money (the four core ids above plus every extra
+ * name) — RawLog's category column stores Torn's own name string, so this is
+ * what rebuild's unmapped-money safeguard matches against.
+ */
+var MONEY_CAT_NAME_SET = (function () {
+  var s = {};
+  ['Money outgoing', 'Money incoming', 'Vault', 'Offshore bank']
+    .concat(EXTRA_MONEY_CAT_NAMES)
+    .forEach(function (n) { s[n] = true; });
+  return s;
+})();
 
 /**
  * Log types that move money between your own accounts — bank invest/withdraw,
@@ -101,7 +160,10 @@ var MONEY_CATS = [14, 17, 138, 145];
  * realized/unrealized split — never the total.
  */
 var TRANSFER_TYPES = {
-  '5450': true, '5451': true, '5460': true,   // bank invest/withdraw, cashier's check
+  // 5450 is deliberately NOT here anymore: bank interest is recognized as
+  // income at invest time (money_key 'worth-amount'), so the withdraw (5451)
+  // returns principal + already-counted interest and must not book cash.
+  '5451': true, '5460': true, '5461': true,   // bank withdraw, cashier's check pair
   '5850': true, '5851': true,                 // vault deposit/withdraw
   '6726': true, '6735': true, '6736': true,   // faction vault deposit + gives (see FACTION_VAULT_*)
   '6010': true, '6011': true,                 // offshore bank deposit/withdraw
@@ -123,6 +185,90 @@ var TRANSFER_TYPES = {
  * in categories 14/17, which MONEY_CATS already fetches, and moneyOf_ already
  * reads their `money` field — so trade cash is in the ledger today.
  */
+/**
+ * Verified per-log-type mapping for money-bearing types the category rules
+ * cannot place — field semantics confirmed against live log dumps (the same
+ * mapping knowledge the TornCashflow userscript is built on). Format:
+ *   id: { d: direction, b: bucket, k: optional money_key }
+ *
+ * Applied by refreshReference on new rows, and healed onto existing rows ONLY
+ * while the row still holds the exact auto-guess this code would produce — a
+ * deliberate user edit never matches the fresh guess, so it always survives.
+ *
+ * Deliberate accounting choices mirrored from TornCashflow:
+ *   - 4800 'Money sent' is a transfer (a gift out is not a loss), while
+ *     4810 'Money received' IS income — same asymmetry TornCashflow uses.
+ *   - Crime loot / item finds / items sent-received (9020, 7011, 4102, 4103)
+ *     are custody changes with no cash field: ignored here (the cash-only
+ *     ledger has no item valuation; the FlipProfit view covers trade items).
+ *   - 5510/5511 stock buy/sell are NOT transfers here, unlike TornCashflow:
+ *     this ledger's Compare math needs the principal as cash flow so that
+ *     delta = realized + unrealized stays balanced.
+ */
+var REFERENCE_LOGMAP = {
+  // ---- income ----
+  '9015': { d: 'income', b: 'Crime' },       // crime success (money_gained)
+  '9052': { d: 'income', b: 'Crime' },       // bootlegging DVD sale
+  '9056': { d: 'income', b: 'Crime' },       // skimming card-details sale
+  '5720': { d: 'income', b: 'Crime' },       // crime 1.0 success money gain
+  '8155': { d: 'income', b: 'Attacks' },     // you mug someone (money_mugged)
+  '6220': { d: 'income', b: 'Job' },         // city job pay
+  '6221': { d: 'income', b: 'Job' },         // company employee pay
+  '6509': { d: 'income', b: 'Job' },         // company special payout
+  '6404': { d: 'income', b: 'Job' },         // city job special payout
+  '5531': { d: 'income', b: 'Stocks' },      // stock dividend (money)
+  '5937': { d: 'income', b: 'Property' },    // property rent
+  '5928': { d: 'income', b: 'Property' },    // property sold (cost = proceeds)
+  '6012': { d: 'income', b: 'Bank' },        // offshore bank interest
+  '7815': { d: 'income', b: 'Mission' },     // mission reward (credits not counted)
+  '4810': { d: 'income', b: 'Other' },       // money received from a player
+  '6811': { d: 'income', b: 'Faction' },     // faction payday received
+  '1113': { d: 'income', b: 'ItemMarket' },  // item market sell (net proceeds)
+  '1104': { d: 'income', b: 'ItemMarket' },  // legacy market sell
+  '1226': { d: 'income', b: 'Bazaar' },      // bazaar sell
+  '1221': { d: 'income', b: 'Bazaar' },      // legacy bazaar sell
+  '5011': { d: 'income', b: 'Points' },      // points sold to a player
+  // ---- expense ----
+  '9030': { d: 'expense', b: 'Crime' },      // lost hustling wager (money_lost)
+  '5715': { d: 'expense', b: 'Crime' },      // crime 1.0 fail money loss
+  '9165': { d: 'expense', b: 'Crime' },      // crime critical fail
+  '9053': { d: 'expense', b: 'Crime' },      // bootlegging online store cost
+  '9071': { d: 'expense', b: 'Crime' },      // crime cost
+  '8156': { d: 'expense', b: 'Attacks' },    // you got mugged (money_mugged)
+  '4200': { d: 'expense', b: 'Shop' },       // shop purchase
+  '4201': { d: 'expense', b: 'Abroad' },     // goods bought abroad
+  '6001': { d: 'expense', b: 'Travel' },     // flight fee
+  '6015': { d: 'expense', b: 'Travel' },     // fortune teller
+  '5920': { d: 'expense', b: 'Property' },   // property upkeep
+  '5927': { d: 'expense', b: 'Property' },   // property bought
+  '5900': { d: 'expense', b: 'Property' },   // property upgrade
+  '5960': { d: 'expense', b: 'Other' },      // education cost
+  '6005': { d: 'expense', b: 'Other' },      // rehab cost
+  '5555': { d: 'expense', b: 'Other' },      // subscription
+  '8705': { d: 'expense', b: 'Racing' },     // racing upgrade
+  '6700': { d: 'expense', b: 'Bounties' },   // bounty placed (cost = reward + fee)
+  '5010': { d: 'expense', b: 'Points' },     // points bought on the market
+  // ---- transfers (own money moving, never profit) ----
+  '4800': { d: 'transfer_out', b: 'Other' },   // money sent to a player
+  '5451': { d: 'transfer_in',  b: 'Bank' },    // bank withdraw (interest already counted)
+  '5461': { d: 'transfer_in',  b: 'Bank' },    // cashier's check received half
+  '5460': { d: 'transfer_out', b: 'Bank' },    // cashier's check sent half
+  '6810': { d: 'transfer_out', b: 'Faction' }, // faction payday paid to a member
+  // ---- deliberately not money for this ledger ----
+  '6795': { d: 'ignore', b: 'Faction' },     // OC payout into the vault (vault math)
+  '8166': { d: 'ignore', b: 'Attacks' },     // you got arrested (someone else's bounty)
+  '5371': { d: 'ignore', b: 'Other' },       // someone else bailed you out
+  '5521': { d: 'ignore', b: 'Stocks' },      // stock merge (amount = share count)
+  '9020': { d: 'ignore', b: 'Crime' },       // crime loot items (no cash field)
+  '7011': { d: 'ignore', b: 'Other' },       // item find (no cash field)
+  '4102': { d: 'ignore', b: 'Trade' },       // items sent (custody change)
+  '4103': { d: 'ignore', b: 'Trade' },       // items received (custody change)
+  '4442': { d: 'ignore', b: 'Trade' },       // trade-window money add (intermediate)
+  '4443': { d: 'ignore', b: 'Trade' },       // trade-window money remove (intermediate)
+  '4480': { d: 'ignore', b: 'Trade' },       // THEIR trade-window money add
+  '4481': { d: 'ignore', b: 'Trade' }        // THEIR trade-window money remove
+};
+
 var TRADE_TYPES = [4445, 4446];
 
 /**
@@ -219,6 +365,47 @@ function fetchJson_(url) {
     }
     return json;
   }
+}
+
+/**
+ * Every category id the sync should walk: MONEY_CATS plus the
+ * EXTRA_MONEY_CAT_NAMES resolved to ids from /torn/logcategories. Resolution
+ * is cached in Script Properties for 7 days (EXTRA_CAT_IDS / EXTRA_CAT_IDS_TS)
+ * so the hourly sync costs no extra request; a failed refresh falls back to
+ * the last cache, then to MONEY_CATS alone.
+ */
+function moneyCategoryIds_() {
+  var props = PropertiesService.getScriptProperties();
+  var cached = props.getProperty('EXTRA_CAT_IDS');
+  var ts = Number(props.getProperty('EXTRA_CAT_IDS_TS') || 0);
+  if (cached && Date.now() - ts < 7 * 86400000) {
+    try { return MONEY_CATS.concat(JSON.parse(cached)); } catch (e) { /* refetch */ }
+  }
+  var extras = [];
+  try {
+    var j = fetchJson_(API + '/torn/logcategories?key=' + key_());
+    var cats = j.logcategories || j.categories || [];
+    var want = {};
+    EXTRA_MONEY_CAT_NAMES.forEach(function (n) { want[String(n).toLowerCase()] = true; });
+    cats.forEach(function (c) {
+      if (want[String(c.title || c.name || '').toLowerCase()]) extras.push(num_(c.id));
+    });
+    props.setProperty('EXTRA_CAT_IDS', JSON.stringify(extras));
+    props.setProperty('EXTRA_CAT_IDS_TS', String(Date.now()));
+  } catch (e) {
+    if (cached) { try { return MONEY_CATS.concat(JSON.parse(cached)); } catch (e2) {} }
+  }
+  return MONEY_CATS.concat(extras);
+}
+
+/** BACKFILLED_CATS property -> {catIdString: true} (sync.gs backfill tracking). */
+function readBackfilledCats_(props) {
+  var set = {};
+  try {
+    JSON.parse(props.getProperty('BACKFILLED_CATS') || '[]')
+      .forEach(function (c) { set[String(c)] = true; });
+  } catch (e) { /* treat as empty */ }
+  return set;
 }
 
 function ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }

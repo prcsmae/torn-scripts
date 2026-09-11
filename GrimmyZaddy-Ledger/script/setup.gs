@@ -61,18 +61,35 @@ function refreshReference() {
   }
 
   var catNames = categoryNames_();          // catId -> 'Money outgoing', 'Vault'...
+  // Casino categories (CASINO_CAT_NAMES) resolved from the same reference
+  // pull; their log types get the generic net rule instead of title guessing.
+  var casinoIds = {};
+  Object.keys(catNames).forEach(function (cid) {
+    if (CASINO_CAT_NAMES.indexOf(catNames[cid]) >= 0) casinoIds[cid] = true;
+  });
   var members = {};                         // catId -> {logTypeId: true}
-  MONEY_CATS.forEach(function (c) { members[c] = categoryTypeIds_(k, c); });
+  moneyCategoryIds_().forEach(function (c) { members[c] = categoryTypeIds_(k, c); });
+  // Log-type ids belonging to a casino category — healLegacyGuesses_ needs the
+  // id set because stored rows carry the category LABEL, which old rows,
+  // synced before the extra categories existed, never had.
+  var casinoTypeIds = {};
+  Object.keys(casinoIds).forEach(function (cid) {
+    var m = members[cid] || {};
+    Object.keys(m).forEach(function (tid) { casinoTypeIds[tid] = true; });
+  });
 
   var rows = types.map(function (t) {
     if (existing[String(t.id)]) return existing[String(t.id)];
     var id = String(t.id);
-    var dc = directionAndCategory_(id, t.title, members, catNames);
-    return [Number(t.id), t.title, dc.direction, guessBucket_(t.title),
-            DERIVED_MONEY_KEYS[id] || '', dc.category];
+    var dc = directionAndCategory_(id, t.title, members, catNames, casinoIds);
+    return [Number(t.id), t.title, dc.direction,
+            dc.bucket || guessBucket_(t.title),
+            DERIVED_MONEY_KEYS[id] || dc.moneyKey || '', dc.category];
   });
   rows.sort(function (a, b) { return a[0] - b[0]; });
-  rows = healLegacyGuesses_(rows);   // fix stale guesses from older code versions
+  // fix stale guesses from older code versions, then apply the verified
+  // reference mapping where a row still holds a pure auto-guess
+  rows = healLegacyGuesses_(rows, casinoTypeIds, members, catNames, casinoIds);
 
   clearBody_(sheet);
   writeRows_(sheet, rows);
@@ -80,7 +97,7 @@ function refreshReference() {
 }
 
 /** Direction + category label for a log type id, driven by its Torn category. */
-function directionAndCategory_(id, title, members, catNames) {
+function directionAndCategory_(id, title, members, catNames, casinoIds) {
   // Faction vault money movements are tracked by the ledger's vault-balance
   // math (see FACTION_VAULT_* in config.gs) and must never land in Income /
   // Expenses. They also belong to money categories 14/17, so they are keyed on
@@ -119,6 +136,15 @@ function directionAndCategory_(id, title, members, catNames) {
   var direction;
   if (catId === 14)               direction = 'expense';
   else if (catId === 17)          direction = 'income';
+  // Casino games: one generic net rule (see CASINO_CAT_NAMES). A win logs
+  // won_amount AND bet_amount (net in), a loss only bet_amount (net out as a
+  // negative income row) — bets never inflate Expenses and wins are booked
+  // net, exactly like TornCashflow's casinoNet(). Must precede the generic
+  // deposit/withdraw regexes (a 'Bookie deposit' title would otherwise match).
+  else if (casinoIds && casinoIds[catId]) {
+    return { direction: 'income', category: catNames[catId] || String(catId),
+             bucket: 'Casino', moneyKey: 'won_amount?bet_amount' };
+  }
   // Faction vault moves only shuffle money between your wallet and the faction
   // vault, so they are transfers — never income or spending. Order-independent
   // on 'faction' so word-order variants are caught, matching the heal.
@@ -208,10 +234,33 @@ function guessBucket_(title) {
  * the previous guessing produced are touched — anything you edited deliberately
  * is left alone. Already-healed rows no longer match, so it is idempotent.
  */
-function healLegacyGuesses_(rows) {
+function healLegacyGuesses_(rows, casinoTypeIds, members, catNames, casinoIds) {
   return rows.map(function (r) {
     var title = String(r[1] || '');
     var t = title.toLowerCase();
+    // Casino rows mapped before the net rule existed carry per-row income/
+    // expense title guesses with a blank money_key (a loss booked as a win).
+    // A blank money_key means the row was never deliberately configured, so
+    // heal it to the generic net rule; an explicit money_key always survives.
+    if (casinoTypeIds && casinoTypeIds[String(r[0])] && !String(r[4] || '').trim()) {
+      r[2] = 'income';
+      r[4] = 'won_amount?bet_amount';
+      if (String(r[3] || '') === guessBucket_(title)) r[3] = 'Casino';
+    }
+    // REFERENCE_LOGMAP: verified direction/bucket/money_key per log type
+    // (field semantics confirmed against live log dumps — see the constant's
+    // doc in config.gs). Applied only while the row still holds the exact
+    // auto-guess this code would produce, so a deliberate edit always wins.
+    var ref = REFERENCE_LOGMAP[String(r[0])];
+    if (ref && members && catNames) {
+      var oldDc = directionAndCategory_(String(r[0]), title, members, catNames, casinoIds);
+      if (String(r[2] || '') === oldDc.direction &&
+          String(r[3] || '') === (oldDc.bucket || guessBucket_(title))) {
+        r[2] = ref.d;
+        r[3] = ref.b;
+      }
+      if (ref.k && !String(r[4] || '').trim()) r[4] = ref.k;
+    }
     // The old bucket rule sent every 'abroad buy/sell' to Travel (its regex
     // matched on 'abroad'); those now have their own Abroad bucket.
     if (String(r[3] || '') === 'Travel' && guessBucket_(title) === 'Abroad') {
@@ -260,8 +309,8 @@ function applyTypeDropdowns_(sheet, n) {
               'transfer_in', 'transfer_out', 'ignore'];
   var buckets = ['Abroad', 'Adverts', 'Attacks', 'Auction', 'Bank', 'Bazaar',
                  'Bounties', 'Casino', 'Church', 'Company', 'Crime', 'Faction',
-                 'ItemMarket', 'Job', 'Mission', 'Other', 'Property', 'Racing',
-                 'Shop', 'Stocks', 'Trade', 'Travel', 'Vault'];
+                 'ItemMarket', 'Job', 'Mission', 'Other', 'Points', 'Property',
+                 'Racing', 'Shop', 'Stocks', 'Trade', 'Travel', 'Vault'];
   // allowInvalid keeps the arrow a suggestion while still accepting a custom
   // label you type yourself — the bucket is free-form, not a locked list.
   sheet.getRange(2, 3, n - 1, 1).setDataValidation(

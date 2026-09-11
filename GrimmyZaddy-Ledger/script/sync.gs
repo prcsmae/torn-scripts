@@ -111,9 +111,15 @@ function syncLogs() {
   }
 
   try {
+    // Every money category: MONEY_CATS plus the extra money-bearing
+    // categories resolved by name (crime income, muggings, casino, hunting,
+    // missions, dividends, job specials, faction payday, property,
+    // bounties...). Cached in Script Properties, so the hourly run pays no
+    // extra request for the resolution.
+    var cats = moneyCategoryIds_();
     // ---- Pass 1: incremental, newest first ------------------------------
     // capped: history deeper than this run's window remains unfetched.
-    MONEY_CATS.forEach(function (cat) {
+    cats.forEach(function (cat) {
       var cursorTo = 0;
       for (var page = 0; page < MAX_PAGES; page++) {
         // from = watermark - 1: the docs say from is exclusive (\"after this time\")
@@ -139,29 +145,66 @@ function syncLogs() {
     // BACKFILL_TO is the oldest timestamp fetched so far; each run fetches the
     // window just below it and advances the cursor. Deleted once every category
     // has no entries left (a short or empty page means that category is done).
+    // BACKFILLED_CATS records categories whose full history has been walked, so
+    // categories added later by EXTRA_MONEY_CAT_NAMES resolution get their own
+    // backfill even when the main cursor finished long ago. An install
+    // upgraded from before the extra categories existed has no BACKFILLED_CATS:
+    // with a finished backfill (BACKFILL_TO unset) the original four
+    // categories are marked done so only the new extras are walked.
     var backfillTo = Number(props.getProperty('BACKFILL_TO') || 0);
-    if (!backfillTo && capped) {
-      var floor = Math.min(minStored, runMin);
-      backfillTo = isFinite(floor) ? floor : 0;
+    var backfilledCats = readBackfilledCats_(props);
+    if (props.getProperty('BACKFILLED_CATS') === null && !backfillTo) {
+      MONEY_CATS.forEach(function (c) { backfilledCats[String(c)] = true; });
+    }
+    if (!backfillTo) {
+      if (capped) {
+        var floor = Math.min(minStored, runMin);
+        backfillTo = isFinite(floor) ? floor : 0;
+      } else {
+        // A category never backfilled still needs its history even though the
+        // original cursor finished: continue from the deepest point known.
+        for (var ci = 0; ci < cats.length; ci++) {
+          if (!backfilledCats[String(cats[ci])]) {
+            var nfloor = Math.min(minStored, runMin);
+            backfillTo = isFinite(nfloor) ? nfloor : Math.floor(Date.now() / 1000);
+            break;
+          }
+        }
+      }
     }
     moreHistory = false;
     backfillFloor = backfillTo;
 
     if (backfillTo > 0) {
-      MONEY_CATS.forEach(function (cat) {
+      // Full-history walks are the expensive part (~20 paced calls per
+      // category): cap how many not-yet-backfilled categories one run starts
+      // so a run with many new categories stays inside the six-minute cap.
+      // Deferred categories keep BACKFILL_TO alive and finish on later runs.
+      var walkBudget = 6, deferred = false;
+      cats.forEach(function (cat) {
+        var key = String(cat);
+        if (!backfilledCats[key]) {
+          if (walkBudget <= 0) { deferred = true; return; }
+          walkBudget--;
+        }
+        var done = false;
         var cursor = backfillTo;
         for (var page = 0; page < MAX_PAGES; page++) {
           var url = API + '/user/log?key=' + key_() + '&cat=' + cat
                   + '&to=' + cursor + '&limit=100';
           var log = fetchJson_(url).log || [];
-          if (!log.length) break;
+          if (!log.length) { done = true; break; }
           var r = consume(log);
           if (r.oldest < backfillFloor) backfillFloor = r.oldest;
           if (log.length === 100) moreHistory = true;
-          if (log.length < 100) break;     // this category's history is exhausted
+          if (log.length < 100) { done = true; break; } // history exhausted
           cursor = r.oldest;               // keep walking further back
         }
+        if (done) backfilledCats[key] = true;  // only after a complete walk
       });
+      if (deferred) moreHistory = true;   // keep the cursor for the next run
+      props.setProperty('BACKFILLED_CATS',
+        JSON.stringify(Object.keys(backfilledCats).map(Number)));
       if (moreHistory) props.setProperty('BACKFILL_TO', String(backfillFloor));
       else props.deleteProperty('BACKFILL_TO');
     }

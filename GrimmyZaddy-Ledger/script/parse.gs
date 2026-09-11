@@ -17,6 +17,12 @@ function moneyOf_(r, t) {
   if (t && t.moneyKey) {
     var v = moneyExpr_(d, t.moneyKey);
     if (v !== null) return v;
+    // A DERIVED expression (/2, a-b, a?b) encodes the exact shape of one log
+    // type, so a missing field means the row does not match the type's known
+    // shape and must NOT be re-guessed by firstKey_ — a casino loss would
+    // otherwise fall back to bet_amount and be booked as a WIN. Plain field
+    // names keep the fallback for compatibility with older maps.
+    if (/[\/?-]/.test(t.moneyKey)) return null;
   }
 
   var v2 = firstKey_(d, MONEY_KEYS);
@@ -45,8 +51,11 @@ function moneyOf_(r, t) {
  *   'field'       -> data.field
  *   'field/2'     -> floor(data.field / 2)   (high-low cash in half pays half the pot)
  *   'field-other' -> data.field - data.other (stock sells pay worth minus fees)
- * Returns null when the expression references a field the data lacks, so the
- * row keeps its normal treatment (firstKey_ fallback, then Exceptions).
+ *   'a?b'         -> a - b when a exists, else -b (casino net: a win logs
+ *                    won_amount AND bet_amount, a loss only the bet)
+ * Returns null when the expression references a field the data lacks. For a
+ * derived expression that null is authoritative (see moneyOf_); a plain field
+ * name falls back to firstKey_ and then to Exceptions.
  */
 function moneyExpr_(d, expr) {
   expr = String(expr || '').trim();
@@ -59,6 +68,16 @@ function moneyExpr_(d, expr) {
   if (m) {
     return (d[m[1]] !== undefined && d[m[2]] !== undefined)
       ? num_(d[m[1]]) - num_(d[m[2]]) : null;
+  }
+
+  // 'a?b' — casino-style net. A winning entry logs both fields (net in), a
+  // losing entry only the bet (net out, returned negative so it can sit on
+  // the income tab as a true signed movement).
+  m = expr.match(/^([A-Za-z_]+)\?([A-Za-z_]+)$/);
+  if (m) {
+    if (d[m[1]] !== undefined) return num_(d[m[1]]) - num_(d[m[2]]);
+    if (d[m[2]] !== undefined) return -num_(d[m[2]]);
+    return null;
   }
 
   return d[expr] !== undefined ? num_(d[expr]) : null;

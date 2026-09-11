@@ -47,14 +47,26 @@ Input, edited by you:
 - **LogTypeMap** — the control panel. One row per Torn log type: `direction`
   (how it moves money), `bucket` (grouping label), an optional `money_key`
   naming the exact data field that holds the amount — or a tiny derived
-  expression: `field/2` (halved, floored) or `field-other` (a difference).
-  Setup pre-fills the derived keys for the log types that need them (high-low
-  cash-in pays `pot/2`, stock sells pay `worth-fees`), from Torn's own money
-  categories (see below). The
+  expression: `field/2` (halved, floored), `field-other` (a difference), or
+  `field1?field2` (a net with fallback: `field1-field2` when field1 exists,
+  else `-field2` — the casino rule). Setup pre-fills the derived keys for the
+  log types that need them (high-low cash-in pays `pot/2`, stock sells pay
+  `worth-fees`, hunting nets `income-cost`, bank interest is recognized once
+  as `worth-amount` when the investment is made, every casino game nets
+  `won_amount?bet_amount`), and `REFERENCE_LOGMAP` fills a verified
+  direction/bucket/money_key for the money-bearing log types outside the core
+  money categories (crime income and costs, muggings, missions, dividends,
+  job/company specials, property rent/upkeep/sales, bounties, faction payday,
+  points-market trades — the same field-by-field mapping the TornCashflow
+  userscript is built on). A derived `money_key` is authoritative: when the
+  data lacks its fields the row goes to Exceptions instead of being re-guessed
+  (a casino loss can never fall back to being booked as a win). The
   `direction` and `bucket` columns have in-cell dropdowns — pick a label or type
   your own — and every edit you make survives re-running setup; only clearly
-  stale auto-guesses are healed automatically. `bucket` is what the Dashboard's
-  income-by-source and expenses-by-category rankings group by.
+  stale auto-guesses are healed automatically (reference and derived values
+  are only applied while a row still holds the exact auto-guess). `bucket` is
+  what the Dashboard's income-by-source and expenses-by-category rankings
+  group by.
 
 Output, rewritten on every rebuild:
 
@@ -296,16 +308,19 @@ flight costs and a user ID as four million of rent.)
 
 ## Efficiency
 
-- **API v2 filtered by Torn's money categories.** `syncLogs` requests only
-  categories 14 ("Money outgoing"), 17 ("Money incoming"), 138 ("Vault") and
-  145 ("Offshore bank"), so every income, expense and transfer entry is captured
-  automatically — no per-type mapping is needed for coverage, and nothing
-  irrelevant is downloaded or stored. The two finalized trade item legs (4445
-  "Trade items outgoing" / 4446 "Trade items incoming", category 94) are
-  fetched with a standalone `log=4445,4446` selection (the `log` param cannot
-  combine with `cat`); trade money legs (4440/4441) are already covered by
-  categories 14/17. Trade history below the watermark is backfilled once via a
-  `TRADE_BACKFILL_TO` cursor, then marked done.
+- **API v2 filtered by money categories.** `syncLogs` walks categories
+  14 ("Money outgoing"), 17 ("Money incoming"), 138 ("Vault") and
+  145 ("Offshore bank") plus the money-bearing categories Torn keeps outside
+  them — crimes, muggings, casino games, hunting, missions, dividends, job
+  specials, faction payday, property, bounties and more
+  (`EXTRA_MONEY_CAT_NAMES`, resolved to ids from `/torn/logcategories` and
+  cached for 7 days). Coverage of those extra categories is per-type via
+  `REFERENCE_LOGMAP` (verified against live log dumps). Each category's full
+  history is backfilled once and recorded in `BACKFILLED_CATS`, so categories
+  added in a later update are walked without re-walking the originals. The two
+  finalized trade item legs (4445/4446) are fetched with a standalone
+  `log=4445,4446` selection; trade money legs (4440/4441) are already covered
+  by categories 14/17.
 - **No item reference at setup.** Setup skips Torn's item catalog — the ledger
   only needs the money amount and title, which every log carries. The
   FlipProfit tab optionally fetches it once (Torn > 11, or automatically on
@@ -386,6 +401,15 @@ trade moved; a trade with no money leg values at 0, and the money legs
 Those are legacy auto-guesses from older code versions. Run Torn > 6. Refresh
 log-type reference — it heals rows that still hold the old defaults — then
 Torn > 3. Rebuild only. Fresh setups never have the problem.
+
+**First syncs after the money-categories update are heavier.** The extra
+categories (crimes, casino, property, ...) are backfilled like the originals:
+a few Sync runs, each pulling up to ~2,000 entries per category, with at most
+six not-yet-backfilled categories started per run to stay inside the six-minute
+cap. Diagnose sync lists every category being walked. Casino entries land as
+net income rows (a loss is a negative income row, not an expense), bank
+interest appears once at invest time as `worth-amount`, and unmapped
+money-category logs surface on the Exceptions tab.
 
 Most wrong numbers are mapping problems in LogTypeMap, not code bugs. A missing
 income row is far more often an unmapped log type than a fault in `rebuild`.

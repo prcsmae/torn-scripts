@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Torn Trading Profit Calculator
 // @namespace    http://tampermonkey.net/
-// @version       25.0
+// @version       26.0
 // @description  Trade profit calculator with profit-only view and round-trip flight-time profit/hr.
 // @author       motherBarker (and China)
 // @match        https://www.torn.com/trade.php*
 // @grant        GM_xmlhttpRequest
 // @connect      api.torn.com
+// @connect      weav3r.dev
 // ==/UserScript==
 
 (function () {
@@ -84,6 +85,8 @@
       1: "Torn City",
       3: "Hawaii",
     },
+    bazaarUndercut: 1, // price bazaar listings at lowest_price - this
+    weav3rBase: "https://weav3r.dev/api", // TornW3B community API (bazaar data)
     cacheDuration: 3600000, // 1 hour market cache
     debug: true,
   };
@@ -234,6 +237,57 @@
     };
   }
 
+  // TornW3B community API helper (public, no key needed for marketplace reads).
+  function weav3rRequest(path) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url: `${CONFIG.weav3rBase}${path}`,
+        headers: { Accept: "application/json" },
+        onload: function (resp) {
+          try {
+            const data = JSON.parse(resp.responseText);
+            if (data && data.error) reject(`W3B Error: ${data.error}`);
+            else resolve(data);
+          } catch (e) {
+            reject(`W3B parse error: ${e.message}`);
+          }
+        },
+        onerror: function (err) {
+          reject(`W3B network error: ${err}`);
+        },
+      });
+    });
+  }
+
+  // Fetch bazaar data for the items you would sell. Returns
+  // { [itemId]: { lowest, avg } } where `lowest` is the cheapest ORGANIC bazaar
+  // listing (sponsored rows are skipped) and `avg` is the bazaar average.
+  // Either can be null when the item has no bazaar presence.
+  async function fetchBazaarPrices(itemIds) {
+    const ids = [...new Set(itemIds)].filter(Boolean);
+    const bazaar = {};
+    for (const id of ids) {
+      try {
+        const d = await weav3rRequest(`/marketplace/${id}`);
+        const listings = Array.isArray(d.listings) ? d.listings : [];
+        let lowest = null;
+        for (const l of listings) {
+          if (l.sponsored) continue; // ignore the sponsored slot
+          const pr = parseFloat(l.price);
+          if (pr > 0) { lowest = pr; break; }
+        }
+        const avg = d.bazaar_average != null ? parseFloat(d.bazaar_average) : null;
+        bazaar[id] = { lowest, avg };
+        log(`Bazaar ${id} (${d.item_name || "?"}): lowest=${lowest} avg=${avg} (${listings.length} listings)`);
+      } catch (e) {
+        log(`Bazaar fetch failed for ${id}: ${e.message || e}`);
+        bazaar[id] = { lowest: null, avg: null };
+      }
+    }
+    return bazaar;
+  }
+
   // ========== ITEM DETAILS (v2) ==========
   // Uses the per-item v2 endpoint which returns market_price (average), sell_price
   // (city-shop buy price), buy_price, and the vendor country+shop (where it is sold).
@@ -363,7 +417,7 @@
   }
 
   // ========== CALCULATE PROFIT ==========
-  function calculateProfit(tradeItems, market, purchase, learned, learnedDurations) {
+  function calculateProfit(tradeItems, market, purchase, learned, learnedDurations, bazaar) {
     const { myItems, theirItems, myCash, theirCash } = tradeItems;
 
     // --- Your side: cost basis ---
@@ -493,7 +547,9 @@
     let proceedsAnon = 0,
       proceedsStd = 0,
       proceedsShop = 0,
-      shopSellable = false;
+      proceedsBazaar = 0,
+      shopSellable = false,
+      bazaarSellable = false;
     for (const it of myItemsDetail) {
       const base = Math.max(0, it.marketPrice - discount);
       const qty = it.quantity;
@@ -503,14 +559,23 @@
         proceedsShop += it.sellPrice * qty;
         shopSellable = true;
       }
+      // Bazaar: list at lowest current listing - undercut (no fees in bazaars).
+      const bz = (bazaar && bazaar[it.itemId]) || {};
+      const bzBase = bz.lowest != null ? bz.lowest : bz.avg != null ? bz.avg : null;
+      if (bzBase != null) {
+        proceedsBazaar += Math.max(0, bzBase - CONFIG.bazaarUndercut) * qty;
+        bazaarSellable = true;
+      }
     }
 
     const netAnon = proceedsAnon - sellCostBasis;
     const netStd = proceedsStd - sellCostBasis;
     const netShop = proceedsShop - sellCostBasis;
+    const netBazaar = proceedsBazaar - sellCostBasis;
     const pctAnon = sellCostBasis > 0 ? (netAnon / sellCostBasis) * 100 : 0;
     const pctStd = sellCostBasis > 0 ? (netStd / sellCostBasis) * 100 : 0;
     const pctShop = sellCostBasis > 0 ? (netShop / sellCostBasis) * 100 : 0;
+    const pctBazaar = sellCostBasis > 0 ? (netBazaar / sellCostBasis) * 100 : 0;
 
     return {
       totalCost,
@@ -532,6 +597,10 @@
       netShop,
       pctShop,
       shopSellable,
+      proceedsBazaar,
+      netBazaar,
+      pctBazaar,
+      bazaarSellable,
       myItems: myItemsDetail,
       theirItems: theirItemsDetail,
       travelDetail,
@@ -892,6 +961,14 @@
                         ${money(result.proceedsStd)} (${fmt(result.netStd)}, ${result.pctStd.toFixed(2)}%)
                     </span>
                 </div>
+                <div class="tpp-row" style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                    <span style="color:#aaa;">Bazaar (low-1):</span>
+                    ${result.bazaarSellable
+                      ? `<span style="font-weight:bold;color:${result.netBazaar >= 0 ? "#28a745" : "#dc3545"};">
+                           ${money(result.proceedsBazaar)} (${fmt(result.netBazaar)}, ${result.pctBazaar.toFixed(2)}%)
+                         </span>`
+                      : `<span style="color:#888;">no bazaar listings</span>`}
+                </div>
                 ${shopLine}
             </div>
         `;
@@ -940,6 +1017,7 @@
         lastData.purchase,
         lastData.learnedCosts,
         lastData.learnedDurations,
+        lastData.bazaar,
       );
       renderStats(result);
     } catch (e) {
@@ -1004,6 +1082,7 @@
         const myItemIds = tradeItems.myItems.map((i) => i.itemId);
         const theirItemIds = tradeItems.theirItems.map((i) => i.itemId);
         const market = await fetchItemDetails([...myItemIds, ...theirItemIds]);
+        const bazaar = await fetchBazaarPrices(myItemIds);
         const purchase = collectPurchaseInfo(logs, myItemIds);
         const learnedCosts = learnTravelCosts(logs);
         const learnedDurations = learnTravelDurations(logs);
@@ -1017,6 +1096,7 @@
           purchase,
           learnedCosts,
           learnedDurations,
+          bazaar,
         };
         const result = calculateProfit(
           tradeItems,
@@ -1024,6 +1104,7 @@
           purchase,
           learnedCosts,
           learnedDurations,
+          bazaar,
         );
         renderStats(result);
         log("Trade calculated.");
