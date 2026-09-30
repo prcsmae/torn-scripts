@@ -25,12 +25,17 @@ exports; the numeric prefixes only document the execution path.
 | `menu.gs` | `runAll`, trigger installation, `onOpen` |
 | `private.gs` | **Your API key (gitignored — see below)** |
 
-`tests/ledger-mapping.test.js` is not part of the Apps Script project. It is a
-plain Node script — `node tests/ledger-mapping.test.js` — that loads the `.gs`
-files and drives the mapping functions (`moneyExpr_`, `moneyOf_`,
-`effectiveTypes_`, `classifyRaw_`, `healLegacyGuesses_`) against real log
-payloads, so a change to `CASINO_LOGMAP`, `REFERENCE_LOGMAP` or a `money_key`
-is checked against the actual amounts Torn logged instead of against the sheet.
+`tests/` holds two plain Node scripts — neither is part of the Apps Script project:
+
+- `node tests/ledger-mapping.test.js` loads the `.gs` files and drives the mapping
+  functions (`moneyExpr_`, `moneyOf_`, `effectiveTypes_`, `classifyRaw_`,
+  `healLegacyGuesses_`) against real log payloads, so a change to `CASINO_LOGMAP`,
+  `REFERENCE_LOGMAP` or a `money_key` is checked against the amounts Torn actually
+  logged instead of against the sheet.
+- `node tests/ledger-symbol-check.js` fails if any file calls a function no file
+  declares — the check that prevents a menu entry (or a sync) from throwing
+  `ReferenceError` at the worst moment. Apps Script only reports the missing
+  function when that code path runs, so this is worth running after every paste.
 
 ## Install
 
@@ -98,8 +103,9 @@ Input, edited by you:
   your own — and every edit survives re-running setup; Torn > 6. Refresh
   log-type reference writes the current tables into the sheet (so LogTypeMap
   shows the truth rather than the last guess), and only clearly stale
-  auto-guesses are rewritten. `bucket` is what the Dashboard's
-  income-by-source and expenses-by-category rankings group by.
+  auto-guesses are rewritten. `bucket` is the grouping label carried onto the
+  Income/Expenses rows — a label, not a ranking: nothing in this lineage
+  summarises by it yet.
 
 Output, rewritten on every rebuild:
 
@@ -112,92 +118,30 @@ Output, rewritten on every rebuild:
   bazaar, trades, item market, stocks, property, company, points.
 - **FactionVault** — append-only snapshots of your personal faction vault
   balance (`[ts, date, balance, source]`). Recorded manually via Torn > 10.
-  Snapshot faction vault (enter what you see on Faction > Vault), auto-fetched
-  from `/faction/{id}/balance` whenever the key has Faction API Access
-  (`source: api`), and — with **no API access at all** — maintained from the
-  logs once you have one snapshot (`source: derived`). One manual snapshot
-  seeds the balance; from then on every sync folds the vault movements in
-  RawLog into it: deposits (6726) add, gives (6735/6736) subtract, and a
-  balance-change log for you (6737/6738, which carries your exact
-  `balance_after`) jumps straight to Torn's number. A fresh manual snapshot
-  re-anchors at any time.
+  Snapshot faction vault — enter what you see on Faction > Vault — or pulled
+  automatically from `/faction/{id}/balance` on every sync when your key has
+  Faction API Access (`source: api`). One manual snapshot to start with; a fresh
+  one re-anchors at any time. See the Faction vault section below.
 - **Compare** — per-snapshot `Δ networth`, split into **realized** (cash the
   ledger actually saw — income minus expenses, mirroring rebuild's accounting
   minus transfers) and **unrealized** (the rest: stock and item value changes,
   looted value). Cumulative columns on each row; the last row is the all-time
   total.
-- **FlipProfit** — per-item profit/loss for items you bought abroad (your flip
-  stock): units bought and sold, buy cost, sell revenue, profit and ROI per
-  item, ranked best-first with a bold totals row and green/red profit cells.
-  A **Buy sources** column splits each item's cost by where it was bought
-  (Abroad, Bazaar, ItemMarket, Trade, …) so you can see which buying channel
-  actually carries your flips. Any item with an abroad purchase is included;
-  cost and revenue count every ledgered buy and sale of that item (so
-  item-market purchases of the same item count too), and failed trades are
-  ignored. Rebuilt with the dashboard.
-  Item names are resolved from Torn's item reference (Torn > 11, or
-  automatically on the first build) — Torn's logs only carry numeric item IDs.
-  **Trades count at their real cash value.** Items sent in a completed trade
-  ("Trade items outgoing") earn the money that trade actually brought in, and
-  items received ("Trade items incoming") cost the money the trade paid out —
-  matched by trade id, and split across a multi-item trade by market value.
-  A trade that moved no money (a pure item swap) values at 0 until those items
-  are sold — market price is never used to invent a profit. The trade money
-  legs (4441/4440) also appear in Income/Expenses as ordinary cash, because
-  the sync already fetches their categories (14/17).
-  Caveats: items you received for free and later sold are invisible to the
-  ledger, which makes that item's profit look higher than it is; stock bought
-  abroad but not yet sold shows as a loss — it's capital on hand.
-- **ItemNames** — cached copy of Torn's item id→name reference (the full item
-  catalog) plus each item's current market price and Torn's item `type` (  Drug, Candy, …). Fetched via Torn > 11. Fetch item names (or automatically
-  the first time the flip table builds with none stored, or when a tab written
-  before the type column existed is detected). Used to show real item names on
-  the FlipProfit tab and to group the CashFlow tab's spending by item type; the
-  market price is used ONLY to split a trade's real money across a multi-item
-  trade — never to value anything.
 - **Dashboard** — a bottom-line income/expenses/net total with a status badge,
-  a **today** snapshot (live income/expenses/net totals plus the day's top
-  three income sources and expense categories, computed at build time) and a
-  **last-7-days** snapshot (live formulas), income and expenses ranked by
-  bucket (Bazaar, ItemMarket, Trade, Casino, …) with the **best cash flow**
-  and **worst spending** named in the section titles and tinted green/red, a
-  **Savings & transfers** section for bank/vault/offshore/loan moves (kept out
-  of the rankings — they only shuffle money between your own accounts — but
-  shown so every dollar reconciles), a day-by-day income/expenses/net table
-  for the last 14 days, the latest networth snapshot, the latest and all-time
-  realized/unrealized split, and long-run daily averages. Money cells are
-  color-coded by sign: green = gain, red = loss, gray = flat.
-- **Today** — the day's full activity as a readable log, rebuilt with the
-  dashboard: every RawLog row from today, newest first, with its bucket,
-  direction (IN = money in, OUT = money out, TRF = transfer-direction row —
-  faction vault moves that never count toward income/expense, — = notification),
-  item, quantity and a signed amount (+ in / − out), plus the same live
-  income/expenses/net-today totals as the Dashboard. Bank/vault/offshore
-  deposits & withdrawals carry IN/OUT and are part of the totals (they're in
-  the Income/Expenses tabs), but stay out of the Dashboard rankings. Rows
-  without a money-bearing direction show no amount.
-- **CashFlow** — the complete money picture the Dashboard's top-6 rankings
-  leave out. Four sections, rebuilt with the dashboard: **Spending by item**
-  (every item you paid cash for — bazaar, item-market, shop and abroad buys —
-  ranked by total, with quantity and where you bought it: this is where
-  happy-jump consumables like Xanax, LSD, ecstasy, candies and erotic DVDs
-  show up, since the flip table only tracks abroad-bought stock),
-  **Spending by item type** (the same money grouped by Torn's item type —
-  Drug, Candy, … — so energy vs happy vs everything else is one glance),
-  and **Expenses / Income by bucket** (the full ranked bucket lists with each
-  bucket's share, where the Dashboard shows only the top six). Trade-ins are
-  excluded from the item views — an item received in a trade cost no cash out
-  of the wallet — and bank/vault/offshore transfers are excluded throughout
-  (they are on the Dashboard under Savings & transfers).
+  the latest networth snapshot with its cash / bank / items / bazaar / stock /
+  property / faction-vault breakdown, the realized-vs-unrealized split for the
+  last snapshot window and all time, and long-run daily rates (days tracked,
+  average daily income, expenses and net). Money cells are color-coded by sign:
+  green = gain, red = loss, gray = flat.
 
 Archive:
 
 - **RawLog** — append-only: rows are never deleted, and every row is kept
-  forever. To stop the file growing with history, rows older than 90 days are
-  *compacted* in place (see Efficiency): their money is frozen into a plain
-  number and the bulky raw JSON plus dead columns are dropped, so the sheet
-  stays small while the views stay exactly as accurate. The only irreplaceable
-  data.
+  forever. Compaction (freezing an old row's money and dropping its raw JSON)
+  is documented and prepared for in `config.gs` — `RETENTION_DAYS`,
+  `COMPACT_AT_ROWS`, `TRADE_RAW_KEEP` — but is NOT implemented in this lineage:
+  no code compacts anything, so every row keeps its full JSON. The only
+  irreplaceable data.
 
 ## LogTypeMap directions
 
@@ -229,14 +173,14 @@ not already recognise — run Torn > 5. Inspect a log type to see the actual
 
 The two trade item legs (4445/4446) are mapped to `item_trade_out`/`item_trade_in`
 — they carry no money of their own, so they must never land in Income/Expenses
-as cash. They stay out of the cash tabs entirely; the FlipProfit view values
-them at the real money their trade moved (see the FlipProfit section above).
+as cash. They stay out of the cash tabs entirely and nothing values them: the
+cash their trade moved appears through the money legs (4440/4441) instead.
 
 ### Buckets
 
-The `bucket` column groups a log type for the Dashboard's ranked
-income-by-source and expenses-by-category tables. Defaults cover the big money
-sources — Bazaar, ItemMarket, Trade, Casino, Crime, Property, Job, Travel,
+The `bucket` column labels a log type on the Income and Expenses rows. Defaults
+cover the big money sources — Bazaar, ItemMarket, Trade, Casino, Crime, Property,
+Job, Travel,
 **Abroad** (items bought/sold while traveling — your flip stock — kept separate
 from travel costs), Bank, Vault, Faction, … — with `Other` as the catch-all.
 The dropdown also suggests `Company` for paycheck log types, and you can type
@@ -273,47 +217,58 @@ window, not a bug.
 ## Faction vault
 
 The faction vault is **not** part of Torn's networth total, so it is tracked
-separately (the Dashboard shows it right below the networth breakdown). There
-are three ways the balance is recorded, in priority order:
+separately (the Dashboard shows it right below the networth breakdown). The
+balance is recorded two ways, in priority order:
 
-1. **Log-derived (`source: derived`) — no permission needed.** Every vault
-   movement is already a log: `Faction deposit money` (6726) adds,
-   `Faction give money send/receive` (6735/6736) subtract, and the balance
-   logs — `Faction money balance change` (6737/6738) and `Faction payout
-   money balance receive` (6795, organized-crime payouts) — carry your exact
-   `balance_after`, which is authoritative. Take ONE manual snapshot to seed
-   the balance (Torn > 10), and every sync after that maintains it from the
-   logs — the FactionVault tab grows a `derived` row whenever the balance
-   changes. The Dashboard's vault line follows automatically.
-   Note on the balance logs: their `user` field is the **banker** who
-   performed the change (anyone with vault access — it is not your ID), so a
-   balance log in your own feed is always about *your* balance and its
-   `balance_after` applies unconditionally.
-   The derived math is **self-healing**: it anchors on the *newest*
-   authoritative number — the latest balance log's `balance_after`, or a
-   fresh manual snapshot taken after it (your re-anchor) — never on a
-   previously computed `derived` row. So even if an old build left a wrong
-   derived row in the tab, the next sync recomputes from the newest balance
-   log and appends the corrected value.
+1. **API (`source: api`)** — if your key has **Faction API Access** (granted by
+   the faction leader), `/faction/{id}/balance` is fetched on every sync and is
+   authoritative. Failed probes back off for six hours, so a key without AA
+   costs no requests.
 2. **Manual (`source: manual`)** — open Faction > Vault, read your balance,
    Torn > 10. Snapshot faction vault, paste the number (commas/`$` are fine).
-   Any manual snapshot re-anchors the derived math, so you can correct drift
-   any time.
-3. **API (`source: api`)** — if your key has **Faction API Access** (granted
-   by the faction leader), `/faction/{id}/balance` is fetched on every sync
-   and is authoritative; while it works, the derived path stands down.
+   This is the only path without AA, so take a snapshot whenever you want the
+   Dashboard's vault line current.
 
-The vault flow logs (6735 give send, 6737/6738 balance change, 6795 OC
-payout balance) live in category 80, outside the money categories, so the
-sync fetches them with a standalone `log=` selection; deposits (6726, cat 14)
-and gives received (6736, cat 17) already come through the normal categories.
+Maintaining the balance from the vault logs themselves (the `source: derived`
+path: 6726 deposits add, 6735/6736 gives subtract, 6737/6738/6795 jump to their
+`balance_after`) existed in the earlier lineage noted under Lineages above and is
+not implemented here.
+
+The vault flow logs (6735 give send, 6737/6738 balance change, 6795 OC payout
+balance) live in category 80, outside the money categories the sync walks, so
+they never arrive in RawLog at all. The two that matter do: deposits (6726, cat
+14) and gives received (6736, cat 17) come through the normal categories, and
+they are the ones the transfer/ignore mapping above needs.
 
 Faction vault deposits and withdrawals are transfers (see LogTypeMap directions
-above): they appear in the Dashboard's **Savings & transfers** section — never
-as income or expenses. Give-send, balance-change and payout logs are `ignore`
-(money left the vault to a third party, stayed inside it, or landed in the
-vault balance as an OC payout — your wallet was never touched), and give-receive
-maps to `transfer_in`, like a vault withdraw.
+above): they never count as income or expenses in the totals. Give-send,
+balance-change and payout logs are `ignore` (money left the vault to a third
+party, stayed inside it, or landed in the vault balance as an OC payout — your
+wallet was never touched), and give-receive maps to `transfer_in`, like a vault
+withdraw.
+
+## Lineages
+
+This project exists in two divergent sets of files, and the confusion that
+follows from mixing them is worth knowing about:
+
+- **This lineage** (the one in git on `main`, 2026-09-10 onward) — the casino
+  category rule, `REFERENCE_LOGMAP`, `CASINO_LOGMAP`, the Exceptions safety net,
+  networth/Compare/FactionVault, `classifyRaw_`. Tabs: Income, Expenses,
+  Exceptions, Networth, Compare, FactionVault, Dashboard, MappingAudit.
+- **The earlier lineage** (2026-08-28 → 2026-08-31, recoverable at git commit
+  `4e25ad0`, a cline stash that never landed on main) — FlipProfit, ItemNames,
+  CashFlow, Today, item-name fetching, RawLog compaction (`compactLogs_` in
+  `sync.gs`), the log-derived faction vault, and menu items 11-14
+  (`Fetch item names`, `Diagnose flip revenue`, `Show trade log types`,
+  `Compact old logs`).
+
+Neither lineage was ever meant to be mixed, but a project can end up holding
+files from both — which is how `Torn > 14` once threw `ReferenceError:
+compactLogs_ is not defined`: the menu came from the earlier lineage and the
+function it calls does not exist in the files that were pasted over it. Before
+trusting a project, run `node tests/ledger-symbol-check.js`: it fails on any
+call to a function no file declares.
 
 ## Design rules
 
@@ -323,13 +278,9 @@ permanently; a bug in `rebuild` costs one rerun.
 
 **Interpretation happens at rebuild time.** `syncLogs` stores the whole `data`
 object as JSON and guesses only cheaply. Everything is re-derived later from that
-JSON, which is why a wrong `money_key` is a one-line edit plus a rebuild. The one
-exception is compaction: rows older than `RETENTION_DAYS` (default 90) have
-their money resolved with the *current* LogTypeMap and frozen into the money
-column, after which their raw JSON is dropped — so a `money_key` change made
-*after* a row is compacted no longer re-derives that row. Fresh rows keep their
-full JSON, so the fix-without-re-download promise still holds for everything
-recent.
+JSON, which is why a wrong `money_key` is a one-line edit plus a rebuild. Nothing
+is frozen in place: this lineage has no compaction pass (see Efficiency), so every
+row keeps the raw JSON its amount was derived from.
 
 **`rebuild` is total and idempotent.** Every derived tab is cleared and rewritten.
 Never append incrementally to one — the duplication looks exactly like real data.
@@ -355,10 +306,11 @@ flight costs and a user ID as four million of rent.)
   finalized trade item legs (4445/4446) are fetched with a standalone
   `log=4445,4446` selection; trade money legs (4440/4441) are already covered
   by categories 14/17.
-- **No item reference at setup.** Setup skips Torn's item catalog — the ledger
-  only needs the money amount and title, which every log carries. The
-  FlipProfit tab optionally fetches it once (Torn > 11, or automatically on
-  first use) so the flip table can show real item names.
+- **No item reference at all.** Setup and the sync never fetch Torn's item
+  catalog — the ledger only needs the money amount and title, which every log
+  carries. Item id/quantity are still stored on RawLog rows for future use, but
+  nothing values items (the FlipProfit and ItemNames tabs that did belong to the
+  earlier lineage only).
 - **Batched sheet I/O** — read a range once, build an array, write once.
 - **Rate-limit safe.** Every API call is paced to ~60/minute (the limit is 100)
   and Torn's "too many requests" error is retried automatically after the window
@@ -366,18 +318,14 @@ flight costs and a user ID as four million of rent.)
   progressively, so even a run that hits the six-minute cap keeps its progress.
 - **One request per hour** via the trigger (plus one paced `/user/networth` call
   per sync for the snapshot).
-- **Old rows are compacted, not deleted.** RawLog grows forever, so the file
-  would too: once a row is older than `RETENTION_DAYS` (default 90, config.gs)
-  its money is resolved with the current LogTypeMap (per-type `money_key`
-  overrides included) and frozen into the money column, then the bulky raw JSON
-  and the dead datetime/category columns are blanked — the views read the
-  frozen money, so every number stays exactly as accurate, and the sheet
-  payload shrinks by the bulk of the JSON. Trade legs (4440/4441/4445/4446)
-  keep their raw JSON (`parsed_trade_id` is load-bearing for the flip view), as
-  do rows whose money cannot be resolved (they are exception candidates).
-  Compaction runs automatically once RawLog passes `COMPACT_AT_ROWS` rows
-  (default 20,000), or on demand via Torn > 14. Compact old logs; it is
-  idempotent, so an interrupted run is finished by the next one.
+- **RawLog grows unbounded.** Nothing compacts it: every row keeps its full JSON
+  forever. `config.gs` documents the intended scheme (`RETENTION_DAYS` 90,
+  `COMPACT_AT_ROWS` 20,000, `TRADE_RAW_KEEP`) and the reading side is already
+  built for it — `moneyOf_` treats a row with no raw JSON as compacted and prices
+  it from the frozen money column, reporting a row that has neither. Implementing
+  it is writing the pass, not changing the accounting. If the file gets unwieldy
+  first, deleting old RawLog rows is safe: Income and Expenses are regenerated
+  from whatever remains.
 
 ## Conventions
 
@@ -422,14 +370,11 @@ trading-ledger version of this script (same column count, different meaning), so
 a RawLog written by the old version would silently shift under a new rebuild.
 Run Setup sheets on a new sheet.
 
-**FlipProfit sells from trades are missing.** The sync fetches the finalized
-item legs automatically; check that LogTypeMap maps "Trade items outgoing" /
-"Trade items incoming" to `item_trade_out`/`item_trade_in` — run Torn > 6.
-Refresh log-type reference to heal rows added as `ignore`, then Torn > 2. Sync
-now (the first sync after the update walks the trade history below the
-watermark once). The flip table values traded items at the real money their
-trade moved; a trade with no money leg values at 0, and the money legs
-(4441/4440) show in Income/Expenses as normal cash.
+**Trade item legs are mapped but not valued.** "Trade items outgoing" /
+"Trade items incoming" map to `item_trade_out`/`item_trade_in`, which keep them
+out of Income/Expenses (they carry no money of their own; the cash legs
+4440/4441 do land in the cash tabs). Nothing values the items — the FlipProfit
+view that did belonged to the earlier lineage (see Lineages).
 
 **Abroad item buys show as Travel / faction vault withdraw counts as income.**
 Those are legacy auto-guesses from older code versions. Run Torn > 6. Refresh
@@ -452,7 +397,7 @@ object; add the type to `CASINO_LOGMAP` in `config.gs` and rebuild. Known gaps
 as of writing: slots `8301` and roulette `8306` losses, and whether blackjack's
 push (`8358`) logs the returned stake.
 
-**Use Torn > 12. Audit log-type mappings** after any Torn update. It lists every
+**Use Torn > 11. Audit log-type mappings** after any Torn update. It lists every
 log type in RawLog that rebuild cannot price, with one sample `data` object each
 — that list, pasted, is everything needed to finish the mapping. A type listed
 with no sample has no raw JSON left, so its shape has to come from Torn > 5.
@@ -463,7 +408,7 @@ a few Sync runs, each pulling up to ~2,000 entries per category, with at most
 six not-yet-backfilled categories started per run to stay inside the six-minute
 cap. Diagnose sync lists every category being walked. Casino entries land as
 signed income rows (a stake is a negative row, a return positive — so a losing
-session never inflates the Expenses rankings), priced per game from
+session never inflates the Expenses tab), priced per game from
 `CASINO_LOGMAP`; bank interest appears once at invest time as `worth-amount`,
 and unmapped money-category logs surface on the Exceptions tab.
 
