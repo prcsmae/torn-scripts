@@ -351,41 +351,41 @@ var TRADE_TYPES = [4445, 4446];
 
 /**
  * Faction vault money movements, verified against /torn/80/logtypes and live
- * log samples. The vault balance is maintained from these (see
- * derivedFactionVault_): deposits (6726, money_deposited) add, gives
- * (6735/6736, money_given) subtract, and a balance-change log is
- * authoritative — its balance_after IS the balance, no math:
- *   6737/6738 "Faction money balance change (send|receive)" — fires when any
- *     banker adjusts the vault balances. The `user` field is the BANKER who
- *     made the change (it can be anyone with vault access), NOT the balance
- *     owner — a log in your own feed is always about YOUR balance, so
- *     balance_after applies unconditionally.
- *   6795 "Faction payout money balance receive" — organized-crime payout,
- *     carries balance_before/balance_after too (verified: its 8/14 before
- *     exactly matched the user's reported vault balance). Also authoritative.
+ * log samples. Their whole job here is to keep vault shuffling OUT of the cash
+ * tabs: a vault deposit or withdrawal moves money between your wallet and the
+ * faction vault, which is a transfer, never income or spending.
+ *
+ *   6726 "Faction deposit money"        wallet -> vault   (transfer_out)
+ *   6736 "Faction give money receive"   vault -> wallet   (transfer_in)
+ *   6735 "Faction give money send"      vault -> someone else       (ignore)
+ *   6737/6738 "Faction money balance change (send|receive)"         (ignore)
+ *   6795 "Faction payout money balance receive" (OC payout)         (ignore)
+ *
+ * The FactionVault tab's BALANCE is a separate matter and does not come from
+ * these logs in this lineage: it is recorded from a manual snapshot (Torn > 10)
+ * or from /faction/{id}/balance when the key has Faction API Access — see the
+ * Faction vault section of the README. The balance fields the balance-change
+ * logs carry are deliberately NOT in MONEY_KEYS, so rebuild can never book a
+ * vault rebalance as income or expense.
  *
  * 6735/6737/6738/6795 live in category 80 (Faction), outside the money
- * categories the sync walks, so they are fetched with a standalone log=
- * selection (FACTION_VAULT_SYNC). 6726 is in category 14 and 6736 in
- * category 17, so they are already synced. The balance fields are NOT in
- * MONEY_KEYS: rebuild must never treat a vault rebalance as income/expense.
+ * categories the sync walks, so they are never fetched at all; 6726 (cat 14)
+ * and 6736 (cat 17) arrive with the normal categories.
  */
 var FACTION_VAULT_IN      = { '6726': true };
 var FACTION_VAULT_OUT     = { '6735': true, '6736': true };
 var FACTION_VAULT_BALANCE = { '6737': true, '6738': true, '6795': true };
-var FACTION_VAULT_SYNC    = [6735, 6737, 6738, 6795];
 
 /**
- * File-size control. RawLog is append-only and every row carries the log's full
- * JSON payload (raw_data), so the file grows with history. COMPACTION keeps the
- * math exact while the sheet stays small: once a row is older than
+ * File-size control, NOT yet implemented in this lineage: nothing compacts
+ * RawLog. The scheme is kept here (and honoured on the reading side — moneyOf_
+ * prices a row with no raw JSON from its frozen money column) so that writing
+ * the pass later is a self-contained job: once a row is older than
  * RETENTION_DAYS its money is resolved with the CURRENT LogTypeMap (per-type
- * money_key overrides included) and frozen into the money column, then raw_data
- * and the dead datetime/category columns are blanked. Trade legs (4440/4441/
- * 4445/4446) keep their raw JSON — parsed_trade_id is load-bearing for the flip
- * view — as do rows whose money cannot be resolved (exception candidates).
- * Compaction runs automatically once RawLog exceeds COMPACT_AT_ROWS, and on
- * demand via the menu. Idempotent: re-running it changes nothing.
+ * money_key overrides included) and frozen into the money column, then
+ * raw_data and the dead datetime/category columns are blanked. Trade legs
+ * (4440/4441/4445/4446) keep their raw JSON, as do rows whose money cannot be
+ * resolved (exception candidates).
  */
 var RETENTION_DAYS = 90;
 var COMPACT_AT_ROWS = 20000;

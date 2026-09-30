@@ -98,20 +98,21 @@ function refreshReference() {
 
 /** Direction + category label for a log type id, driven by its Torn category. */
 function directionAndCategory_(id, title, members, catNames, casinoIds) {
-  // Faction vault money movements are tracked by the ledger's vault-balance
-  // math (see FACTION_VAULT_* in config.gs) and must never land in Income /
-  // Expenses. They also belong to money categories 14/17, so they are keyed on
-  // log type id BEFORE the category rules below:
+  // Faction vault money movements move money between your wallet and the vault
+  // (see FACTION_VAULT_* in config.gs), so they must never land in Income /
+  // Expenses: a deposit is not spending and a payout you never received is not
+  // income. They belong to money categories 14/17, so they are keyed on log type
+  // id BEFORE the category rules below:
   //   6726 deposit                -> transfer_out (wallet -> vault)
   //   6736 give money receive     -> transfer_in  (vault -> wallet, like a vault withdraw)
   //   6735 give money send        -> ignore       (money left the vault to a THIRD party;
-  //                                                your wallet is untouched, the vault math
-  //                                                still counts it by log type)
-  //   6737/6738 balance change    -> ignore       (vault-internal bookkeeping; the vault
-  //                                                math reads balance_after directly)
-  //   6795 OC payout balance      -> ignore       (same: the payout lands in the vault
-  //                                                balance, never the wallet; the vault
-  //                                                math snaps to its balance_after)
+  //                                                your wallet was never touched)
+  //   6737/6738 balance change    -> ignore       (vault-internal bookkeeping, and they
+  //                                                are outside the synced categories anyway)
+  //   6795 OC payout balance      -> ignore       (the payout lands in the vault balance,
+  //                                                never the wallet)
+  // The vault's BALANCE on the FactionVault tab comes from a manual snapshot or
+  // the /faction/{id}/balance API call, not from these logs.
   if (FACTION_VAULT_IN[id])      return { direction: 'transfer_out', category: 'Faction' };
   if (id === '6736')             return { direction: 'transfer_in',  category: 'Faction' };
   if (FACTION_VAULT_OUT[id] || FACTION_VAULT_BALANCE[id])

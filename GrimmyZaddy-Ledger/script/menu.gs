@@ -49,6 +49,6 @@ function onOpen() {
     .addItem('8. Diagnose sync', 'diagnoseSync')
     .addItem('9. Snapshot networth', 'snapshotNetworth')
     .addItem('10. Snapshot faction vault', 'snapshotFactionVault')
-    .addItem('12. Audit log-type mappings', 'auditMappings')
+    .addItem('11. Audit log-type mappings', 'auditMappings')
     .addToUi();
 }
