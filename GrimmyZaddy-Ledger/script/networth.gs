@@ -112,7 +112,10 @@ function realizedPerWindow_(snap, raw, types) {
  */
 function buildCompare_() {
   var snap = readNetworthSnapshots_();
-  var realized = realizedPerWindow_(snap, readRaw_(), readTypeMap_());
+  // effectiveTypes_, not readTypeMap_, so the Compare math counts exactly what
+  // rebuild booked — the two views disagreeing would make delta = realized +
+  // unrealized stop balancing for reasons no column explains.
+  var realized = realizedPerWindow_(snap, readRaw_(), effectiveTypes_(readTypeMap_()));
 
   var rows = [];
   var cumDelta = 0, cumRealized = 0, cumUnrealized = 0;

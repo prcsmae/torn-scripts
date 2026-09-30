@@ -136,14 +136,17 @@ function directionAndCategory_(id, title, members, catNames, casinoIds) {
   var direction;
   if (catId === 14)               direction = 'expense';
   else if (catId === 17)          direction = 'income';
-  // Casino games: one generic net rule (see CASINO_CAT_NAMES). A win logs
-  // won_amount AND bet_amount (net in), a loss only bet_amount (net out as a
-  // negative income row) — bets never inflate Expenses and wins are booked
-  // net, exactly like TornCashflow's casinoNet(). Must precede the generic
-  // deposit/withdraw regexes (a 'Bookie deposit' title would otherwise match).
+  // Casino games: one line per game, all of them on the Income side as signed
+  // rows (see CASINO_CAT_NAMES/CASINO_LOGMAP). A game whose v2 shape is known
+  // gets its verified key; one whose shape is not keeps the generic v1 net as a
+  // guess, which fails loudly into Exceptions rather than booking a wrong
+  // number. Must precede the generic deposit/withdraw regexes (a 'Bookie
+  // deposit' title would otherwise match).
   else if (casinoIds && casinoIds[catId]) {
-    return { direction: 'income', category: catNames[catId] || String(catId),
-             bucket: 'Casino', moneyKey: 'won_amount?bet_amount' };
+    var game = CASINO_LOGMAP[id];
+    return { direction: game ? game.d : 'income', bucket: 'Casino',
+             moneyKey: game ? (game.k || '') : CASINO_GUESS_KEY,
+             category: catNames[catId] || String(catId) };
   }
   // Faction vault moves only shuffle money between your wallet and the faction
   // vault, so they are transfers — never income or spending. Order-independent
@@ -238,26 +241,48 @@ function healLegacyGuesses_(rows, casinoTypeIds, members, catNames, casinoIds) {
   return rows.map(function (r) {
     var title = String(r[1] || '');
     var t = title.toLowerCase();
-    // Casino rows mapped before the net rule existed carry per-row income/
-    // expense title guesses with a blank money_key (a loss booked as a win).
-    // A blank money_key means the row was never deliberately configured, so
-    // heal it to the generic net rule; an explicit money_key always survives.
-    if (casinoTypeIds && casinoTypeIds[String(r[0])] && !String(r[4] || '').trim()) {
-      r[2] = 'income';
-      r[4] = 'won_amount?bet_amount';
-      if (String(r[3] || '') === guessBucket_(title)) r[3] = 'Casino';
+    // Casino rows mapped before the per-game v2 shapes existed carry either a
+    // blank money_key or the generic v1 net. Both are guesses — nothing was
+    // deliberately configured — so heal them to CASINO_LOGMAP. Any other
+    // money_key was chosen by hand and survives.
+    if (casinoTypeIds && casinoTypeIds[String(r[0])]) {
+      var game = CASINO_LOGMAP[String(r[0])];
+      var casinoKey = String(r[4] || '').trim();
+      if (game && (!casinoKey || STALE_GUESS_KEYS[casinoKey])) {
+        r[2] = game.d;
+        r[4] = game.k || '';
+        if (String(r[3] || '') === guessBucket_(title)) r[3] = 'Casino';
+      } else if (!game && !casinoKey) {
+        // No verified shape yet: keep the generic guess so the row flags with a
+        // sample instead of booking a made-up number.
+        r[2] = 'income';
+        r[4] = CASINO_GUESS_KEY;
+        if (String(r[3] || '') === guessBucket_(title)) r[3] = 'Casino';
+      }
     }
     // REFERENCE_LOGMAP: verified direction/bucket/money_key per log type
     // (field semantics confirmed against live log dumps — see the constant's
-    // doc in config.gs). Applied only while the row still holds the exact
-    // auto-guess this code would produce, so a deliberate edit always wins.
+    // doc in config.gs). Healed on the DIRECTION alone: the bucket half of the
+    // old check made drifted rows unhealable, because the bucket rules changed
+    // after the rows were written (guessBucket_('Job pay') was 'Other' before
+    // the Job rule existed, so a stored row could never match the current guess
+    // again and rebuild re-flagged it forever). 'ignore' with no money_key is
+    // the default nothing was ever configured from — a deliberate 'ignore'
+    // always has a key next to it, which is what keeps it.
     var ref = REFERENCE_LOGMAP[String(r[0])];
     if (ref && members && catNames) {
       var oldDc = directionAndCategory_(String(r[0]), title, members, catNames, casinoIds);
-      if (String(r[2] || '') === oldDc.direction &&
-          String(r[3] || '') === (oldDc.bucket || guessBucket_(title))) {
+      var oldBucket = oldDc.bucket || guessBucket_(title);
+      var staleDir = String(r[2] || '') === oldDc.direction ||
+                     (String(r[2] || '') === 'ignore' && !String(r[4] || '').trim());
+      if (staleDir) {
         r[2] = ref.d;
-        r[3] = ref.b;
+        // Keep a bucket you relabelled yourself; heal the default and the old
+        // auto-guess. 'Other' is guessBucket_'s catch-all, so a row still on it
+        // was never grouped deliberately.
+        if (String(r[3] || '') === oldBucket || String(r[3] || '') === 'Other') {
+          r[3] = ref.b || r[3];
+        }
       }
       if (ref.k && !String(r[4] || '').trim()) r[4] = ref.k;
     }
@@ -293,8 +318,10 @@ function healLegacyGuesses_(rows, casinoTypeIds, members, catNames, casinoIds) {
     if (/items outgoing/.test(t) && String(r[2] || '') === 'ignore') r[2] = 'item_trade_out';
     if (/items incoming/.test(t) && String(r[2] || '') === 'ignore') r[2] = 'item_trade_in';
     // Log types whose data carries no matchable money field need a derived
-    // money_key expression (pot/2 for high-low cash-ins, worth-fees for stock
-    // sells). Fill it only when blank so a deliberate override survives.
+    // money_key expression (worth-fees for stock sells, income-cost for
+    // hunting, worth-amount for bank interest — casino games are handled above
+    // from CASINO_LOGMAP). Fill it only when blank so a deliberate override
+    // survives.
     var hint = DERIVED_MONEY_KEYS[String(r[0])];
     if (hint && !String(r[4] || '').trim()) r[4] = hint;
     return r;

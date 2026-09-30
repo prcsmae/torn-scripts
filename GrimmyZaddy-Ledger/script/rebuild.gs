@@ -5,17 +5,22 @@
  * from scratch, so running it twice changes nothing. Never append incrementally to
  * a derived tab — it duplicates on every rerun, and the duplication looks like real
  * data.
+ *
+ * The judgement lives in classifyRaw_, which is pure: rows in, three row arrays
+ * out, no sheet and no clock. rebuild() only writes what it returns, so the part
+ * that decides what a log is worth is testable without a spreadsheet (see
+ * tests/ledger-mapping.test.js).
  */
 
 /**
- * Full recompute of Income and Expenses from RawLog. Idempotent by design — if the
- * numbers ever look wrong, fix LogTypeMap and re-run this. Nothing is lost because
- * RawLog is never touched.
+ * Classify every RawLog row into income, expense or exception.
+ *
+ * `types` is effectiveTypes_(readTypeMap_()) — the sheet's LogTypeMap with the
+ * verified tables (REFERENCE_LOGMAP, CASINO_LOGMAP) filling in the rows nobody
+ * configured, so a mapping that exists in code never depends on a sheet edit
+ * that may not have happened.
  */
-function rebuild() {
-  var raw   = readRaw_();
-  var types = readTypeMap_();
-
+function classifyRaw_(raw, types) {
   var income = [], expenses = [], exceptions = [];
 
   function flag_(r, problem) {
@@ -35,6 +40,13 @@ function rebuild() {
       // the reference deliberately ignores (8166 arrest carries SOMEONE
       // ELSE's bounty money, 5521's amount is a share count, item custody
       // changes) are exempt.
+      //
+      // 'nothing accounts for' means none of the three places a mapping can
+      // live: the LogTypeMap row, REFERENCE_LOGMAP, CASINO_LOGMAP. The latter
+      // two are already folded into `types` by effectiveTypes_, so a type they
+      // cover reaches this branch with a real direction and never flags — a
+      // row that arrives here is genuinely unmapped, which is what the message
+      // asks you to fix.
       var ref = REFERENCE_LOGMAP[r.logType];
       if (ref && ref.d === 'ignore') return;
       if (MONEY_CAT_NAME_SET[r.category]) {
@@ -51,10 +63,18 @@ function rebuild() {
 
     var amount = moneyOf_(r, t);
     if (amount === null) {
-      flag_(r, INCOME_DIRS[t.direction]
-        ? 'Money-in log but no money field found — set money_key on LogTypeMap.'
-        : 'Expense log but no money field found — set money_key on LogTypeMap, or ' +
-          'set direction to ignore if this log is only a notification.');
+      flag_(r, !r.raw
+        // Compaction freezes a row's money and drops its raw JSON, so a
+        // raw-less row normally prices itself. One with nothing frozen either
+        // cannot be interpreted AT ALL — booking $0 would put a silent zero in
+        // the totals for money that really moved, so it is reported.
+        ? 'Row has no raw data and no amount frozen in the money column — ' +
+          'nothing can be booked. Rows like this come from an older RawLog ' +
+          'layout: delete them.'
+        : INCOME_DIRS[t.direction]
+          ? 'Money-in log but no money field found — set money_key on LogTypeMap.'
+          : 'Expense log but no money field found — set money_key on LogTypeMap, or ' +
+            'set direction to ignore if this log is only a notification.');
       return;
     }
 
@@ -66,12 +86,23 @@ function rebuild() {
     }
   });
 
-  var iSheet = tab_(TABS.INCOME);  clearBody_(iSheet);  writeRows_(iSheet, income);
-  var eSheet = tab_(TABS.EXPENSE); clearBody_(eSheet);  writeRows_(eSheet, expenses);
+  return { income: income, expenses: expenses, exceptions: exceptions };
+}
+
+/**
+ * Full recompute of Income and Expenses from RawLog. Idempotent by design — if the
+ * numbers ever look wrong, fix LogTypeMap and re-run this. Nothing is lost because
+ * RawLog is never touched.
+ */
+function rebuild() {
+  var res = classifyRaw_(readRaw_(), effectiveTypes_(readTypeMap_()));
+
+  var iSheet = tab_(TABS.INCOME);  clearBody_(iSheet);  writeRows_(iSheet, res.income);
+  var eSheet = tab_(TABS.EXPENSE); clearBody_(eSheet);  writeRows_(eSheet, res.expenses);
 
   var xSheet = tab_(TABS.EXCEPT, ['date', 'log_type', 'title', 'problem', 'raw_data']);
-  clearBody_(xSheet); writeRows_(xSheet, exceptions);
-  return exceptions.length;
+  clearBody_(xSheet); writeRows_(xSheet, res.exceptions);
+  return res.exceptions.length;
 }
 
 // ---------- readers

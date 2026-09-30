@@ -14,7 +14,7 @@ exports; the numeric prefixes only document the execution path.
 
 | File | Contents |
 |---|---|
-| `config.gs` | Tab names, API base, money-field candidates, shared helpers |
+| `config.gs` | Tab names, API base, money-field candidates, the verified mapping tables |
 | `setup.gs` | Tab creation, log-type reference pull, direction/bucket guessing |
 | `sync.gs` | `syncLogs` — the only writer to RawLog |
 | `parse.gs` | Money extraction from raw log JSON |
@@ -24,6 +24,13 @@ exports; the numeric prefixes only document the execution path.
 | `tools.gs` | Manual menu helpers for diagnosis |
 | `menu.gs` | `runAll`, trigger installation, `onOpen` |
 | `private.gs` | **Your API key (gitignored — see below)** |
+
+`tests/ledger-mapping.test.js` is not part of the Apps Script project. It is a
+plain Node script — `node tests/ledger-mapping.test.js` — that loads the `.gs`
+files and drives the mapping functions (`moneyExpr_`, `moneyOf_`,
+`effectiveTypes_`, `classifyRaw_`, `healLegacyGuesses_`) against real log
+payloads, so a change to `CASINO_LOGMAP`, `REFERENCE_LOGMAP` or a `money_key`
+is checked against the actual amounts Torn logged instead of against the sheet.
 
 ## Install
 
@@ -47,26 +54,52 @@ Input, edited by you:
 - **LogTypeMap** — the control panel. One row per Torn log type: `direction`
   (how it moves money), `bucket` (grouping label), an optional `money_key`
   naming the exact data field that holds the amount — or a tiny derived
-  expression: `field/2` (halved, floored), `field-other` (a difference), or
-  `field1?field2` (a net with fallback: `field1-field2` when field1 exists,
-  else `-field2` — the casino rule). Setup pre-fills the derived keys for the
-  log types that need them (high-low cash-in pays `pot/2`, stock sells pay
-  `worth-fees`, hunting nets `income-cost`, bank interest is recognized once
-  as `worth-amount` when the investment is made, every casino game nets
-  `won_amount?bet_amount`), and `REFERENCE_LOGMAP` fills a verified
+  expression:
+
+  | Form | Meaning |
+  |---|---|
+  | `field` | `data.field` |
+  | `-field` | `-data.field` — a stake, i.e. money out (`-bet`) |
+  | `field/2` | `floor(data.field / 2)` — high-low cash-in half |
+  | `field-other` | `data.field - data.other` — a stock sell's `worth-fees` |
+  | `field1?field2` | `field1 - field2` when field1 exists, else `-field2` — the v1 casino net |
+  | `sum:field` | adds `data.field`, an array of `{label: amount}` entries — v2 craps logs stakes that way; combine as `-sum:bets` |
+
+  A derived `money_key` is authoritative: when the data lacks its fields the
+  row goes to Exceptions instead of being re-guessed (a casino loss can never
+  fall back to being booked as a win).
+
+  Setup pre-fills the keys the known shapes need (stock sells pay `worth-fees`,
+  hunting nets `income-cost`, bank interest is recognized once as
+  `worth-amount` when the investment is made), and two tables in `config.gs`
+  fill in mapping the sheet does not have to carry: `CASINO_LOGMAP` gives every
+  casino log type its verified **v2** shape per game (blackjack `-bet` at start
+  and its gross `winnings`, craps `-sum:bets`/`sum:winnings`, high-low `pot`,
+  lottery and wheel `-cost`, russian roulette `refund` — the v2 log API renamed
+  the per-game fields, so the generic `won_amount?bet_amount` guessed from the
+  v1 API prices almost nothing), and `REFERENCE_LOGMAP` gives a verified
   direction/bucket/money_key for the money-bearing log types outside the core
   money categories (crime income and costs, muggings, missions, dividends,
   job/company specials, property rent/upkeep/sales, bounties, faction payday,
   points-market trades — the same field-by-field mapping the TornCashflow
-  userscript is built on). A derived `money_key` is authoritative: when the
-  data lacks its fields the row goes to Exceptions instead of being re-guessed
-  (a casino loss can never fall back to being booked as a win). The
+  userscript is built on).
+
+  Those two tables are applied at **rebuild** time, not only when the sheet is
+  refreshed: a row that is missing from LogTypeMap, or that still holds an
+  auto-guess (the default `ignore` with no money_key, or the generic casino
+  net), is priced from the table instead of being flagged forever. That is what
+  makes a mapping fix work without a sheet edit — run Torn > 3. Rebuild only,
+  no API call and no refresh needed. Anything you configured yourself wins:
+  a direction you picked, a money_key you typed, and a bucket you relabelled
+  are all left alone. To deliberately exclude a type the tables cover, set its
+  direction to `ignore` **and** put any text in `money_key` (an ignored row's
+  key is never read, which is what marks the row as configured). The
   `direction` and `bucket` columns have in-cell dropdowns — pick a label or type
-  your own — and every edit you make survives re-running setup; only clearly
-  stale auto-guesses are healed automatically (reference and derived values
-  are only applied while a row still holds the exact auto-guess). `bucket` is
-  what the Dashboard's income-by-source and expenses-by-category rankings
-  group by.
+  your own — and every edit survives re-running setup; Torn > 6. Refresh
+  log-type reference writes the current tables into the sheet (so LogTypeMap
+  shows the truth rather than the last guess), and only clearly stale
+  auto-guesses are rewritten. `bucket` is what the Dashboard's
+  income-by-source and expenses-by-category rankings group by.
 
 Output, rewritten on every rebuild:
 
@@ -315,7 +348,8 @@ flight costs and a user ID as four million of rent.)
   specials, faction payday, property, bounties and more
   (`EXTRA_MONEY_CAT_NAMES`, resolved to ids from `/torn/logcategories` and
   cached for 7 days). Coverage of those extra categories is per-type via
-  `REFERENCE_LOGMAP` (verified against live log dumps). Each category's full
+  `REFERENCE_LOGMAP` and `CASINO_LOGMAP` (both verified against live log dumps,
+  applied at rebuild time so a mapping fix needs no sheet edit). Each category's full
   history is backfilled once and recorded in `BACKFILLED_CATS`, so categories
   added in a later update are walked without re-walking the originals. The two
   finalized trade item legs (4445/4446) are fetched with a standalone
@@ -399,17 +433,39 @@ trade moved; a trade with no money leg values at 0, and the money legs
 
 **Abroad item buys show as Travel / faction vault withdraw counts as income.**
 Those are legacy auto-guesses from older code versions. Run Torn > 6. Refresh
-log-type reference — it heals rows that still hold the old defaults — then
-Torn > 3. Rebuild only. Fresh setups never have the problem.
+log-type reference — it heals rows that still hold the old default — then
+Torn > 3. Rebuild only. Fresh setups never have the problem. The heal keys off
+the direction alone now (and a blank money_key), so a row whose bucket was
+written by an older guess is healed too; a bucket you relabelled yourself and a
+money_key you typed always survive.
+
+**Exceptions list rows with "no raw data and no amount frozen".** Those rows
+carry neither the log's raw JSON nor a money figure, so nothing can be derived
+from them — typically leftovers from an older RawLog layout (a sheet written
+before the current columns). Delete them from RawLog; the ledger cannot price
+them and will keep reporting them instead of booking a silent $0.
+
+**A casino game still lands in Exceptions.** Its v2 field shape is not known
+yet, so the ledger refuses to guess and reports the row with a sample. Torn > 5.
+Inspect a log type (one id, or a list like `8301,8306`) prints the real `data`
+object; add the type to `CASINO_LOGMAP` in `config.gs` and rebuild. Known gaps
+as of writing: slots `8301` and roulette `8306` losses, and whether blackjack's
+push (`8358`) logs the returned stake.
+
+**Use Torn > 12. Audit log-type mappings** after any Torn update. It lists every
+log type in RawLog that rebuild cannot price, with one sample `data` object each
+— that list, pasted, is everything needed to finish the mapping. A type listed
+with no sample has no raw JSON left, so its shape has to come from Torn > 5.
 
 **First syncs after the money-categories update are heavier.** The extra
 categories (crimes, casino, property, ...) are backfilled like the originals:
 a few Sync runs, each pulling up to ~2,000 entries per category, with at most
 six not-yet-backfilled categories started per run to stay inside the six-minute
 cap. Diagnose sync lists every category being walked. Casino entries land as
-net income rows (a loss is a negative income row, not an expense), bank
-interest appears once at invest time as `worth-amount`, and unmapped
-money-category logs surface on the Exceptions tab.
+signed income rows (a stake is a negative row, a return positive — so a losing
+session never inflates the Expenses rankings), priced per game from
+`CASINO_LOGMAP`; bank interest appears once at invest time as `worth-amount`,
+and unmapped money-category logs surface on the Exceptions tab.
 
 Most wrong numbers are mapping problems in LogTypeMap, not code bugs. A missing
 income row is far more often an unmapped log type than a fault in `rebuild`.

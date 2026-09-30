@@ -9,18 +9,73 @@
 function inspectLogType() {
   var ui = SpreadsheetApp.getUi();
   var resp = ui.prompt('Inspect log type',
-    'Enter a log type ID (e.g. 1226 for bazaar sell):', ui.ButtonSet.OK_CANCEL);
+    'Enter a log type ID (e.g. 1226 for bazaar sell, or a list: 8301,8306):',
+    ui.ButtonSet.OK_CANCEL);
   if (resp.getSelectedButton() !== ui.Button.OK) return;
 
-  var id = resp.getResponseText().trim();
-  var log = fetchJson_(API + '/user/log?key=' + key_() + '&log=' + id + '&limit=3').log || [];
-  if (!log.length) { ui.alert('No entries found for log type ' + id); return; }
+  // A list is allowed because mapping work usually comes in pairs (a game's bet
+  // and its result logs), and each id costs one paced request anyway.
+  var ids = String(resp.getResponseText()).split(/[^0-9]+/).filter(function (s) { return s; });
+  if (!ids.length) { ui.alert('No log type ID given.'); return; }
 
-  var title = log[0].details && log[0].details.title;
-  var samples = log.slice(0, 3).map(function (e) {
-    return JSON.stringify(e.data, null, 2);
-  }).join('\n\n---\n\n');
-  ui.alert('Log type ' + id + ' — ' + title, samples, ui.ButtonSet.OK);
+  var out = [];
+  ids.forEach(function (id) {
+    var log = [];
+    try { log = fetchJson_(API + '/user/log?key=' + key_() + '&log=' + id + '&limit=3').log || []; }
+    catch (e) { out.push('Log type ' + id + ' — ERROR ' + (e.message || e)); return; }
+    if (!log.length) { out.push('Log type ' + id + ' — no entries for this account'); return; }
+    out.push('Log type ' + id + ' — ' + (log[0].details && log[0].details.title));
+    log.slice(0, 3).forEach(function (e) { out.push(JSON.stringify(e.data, null, 2)); });
+  });
+  ui.alert('Inspect log type', out.join('\n\n---\n\n'), ui.ButtonSet.OK);
+}
+
+/**
+ * Mapping audit: every log type in RawLog, how many of its rows rebuild can
+ * price, and — for each type it cannot — one sample `data` object. This is the
+ * paste-me list after a Torn update adds log types, and it is also how a row
+ * that may have lost its raw JSON announces itself: unpriced with no sample
+ * means the shape cannot be recovered from the sheet at all and has to come
+ * from Torn > 5. Inspect a log type.
+ *
+ * It classifies with effectiveTypes_, the same function rebuild uses, so
+ * "unpriced" here means "lands on the Exceptions tab" there — a row that is
+ * priced but deliberately ignored (a cashier's check leg, a vault move) is not
+ * a problem and is left out.
+ */
+function auditMappings() {
+  var types = effectiveTypes_(readTypeMap_());
+  var by = {};
+  readRaw_().forEach(function (r) {
+    var t = types[r.logType];
+    var priced = t && t.direction !== 'ignore' &&
+      (INCOME_DIRS[t.direction] || EXPENSE_DIRS[t.direction]) &&
+      moneyOf_(r, t) !== null;
+    var e = by[r.logType] || (by[r.logType] =
+      { title: r.title, direction: (t && t.direction) || '(no row)', key: (t && t.moneyKey) || '',
+        rows: 0, unpriced: 0, sample: '' });
+    e.rows++;
+    if (priced) return;
+    e.unpriced++;
+    if (!e.sample && r.raw) e.sample = JSON.stringify(parseRaw_(r));
+  });
+
+  var ids = Object.keys(by).filter(function (id) { return by[id].unpriced; })
+    .sort(function (a, b) { return by[b].unpriced - by[a].unpriced || a - b; });
+  var rows = ids.map(function (id) {
+    var e = by[id];
+    return [Number(id), e.title, e.direction, e.key, e.rows, e.unpriced,
+            e.sample || '(no raw JSON left in RawLog — use Torn > 5. Inspect a log type)'];
+  });
+
+  var sheet = tab_(TABS.AUDIT, ['log_type', 'title', 'direction', 'money_key',
+                                'rows', 'unpriced', 'sample_data']);
+  clearBody_(sheet);
+  writeRows_(sheet, rows);
+  ss_().setActiveSheet(sheet);
+  ss_().toast(rows.length
+    ? rows.length + ' log type(s) need attention — see ' + TABS.AUDIT + '.'
+    : 'Every log type in RawLog is priced.', 'Torn', 8);
 }
 
 /**

@@ -19,7 +19,8 @@ var TABS = {
   FLIPS:    'FlipProfit',
   ITEMS:    'ItemNames',
   CASHFLOW: 'CashFlow',
-  TODAY:    'Today'
+  TODAY:    'Today',
+  AUDIT:    'MappingAudit'
 };
 
 // Torn API v2. The log selection requires a full-access key.
@@ -55,18 +56,14 @@ var QTY_KEYS   = ['quantity', 'qty', 'amount'];
  *   'field-other'   -> data.field - data.other
  *
  * Verified against live logs:
- *   8315 "Casino high-low cash in half" -> {"round":N,"pot":P}; the payout is
- *        half the pot (floored — pot 4651 pays 2325).
- *   8314 "Casino high-low cash in full" -> same shape; payout is the whole pot
- *        (inferred from the type name — no live row seen yet).
  *   5511 "Stock sell" -> worth is gross; the wallet receives worth minus the
  *        broker fee in data.fees.
+ * Casino log types are deliberately NOT here — their per-game v2 shapes live in
+ * CASINO_LOGMAP below, next to the generic guess they replace.
  * Setup writes these into the money_key column of new LogTypeMap rows and
  * heals blank ones on refresh; an explicitly chosen key is never overwritten.
  */
 var DERIVED_MONEY_KEYS = {
-  '8315': 'pot/2',
-  '8314': 'pot',
   '5511': 'worth-fees',
   // 6020 "Hunting session": one entry carries the session's cost AND income,
   // so only the net is a real movement (verified: 22 of 84 real sessions
@@ -116,18 +113,87 @@ var EXTRA_MONEY_CAT_NAMES = [
 ];
 
 /**
- * The casino subset of EXTRA_MONEY_CAT_NAMES. Casino log types get one
- * generic rule (mirroring TornCashflow's casinoNet): direction income with
- * the net money_key 'won_amount?bet_amount' — a win logs won_amount AND
- * bet_amount (net in), a loss only bet_amount (net out as a negative income
- * row), so a losing streak never renders as wins and bets never inflate the
- * Expenses tab. Covers every game, including high-low's pot cash-in, without
- * per-game special cases.
+ * The casino subset of EXTRA_MONEY_CAT_NAMES. Casino log types share one
+ * accounting convention: direction income as SIGNED rows, so a losing session
+ * never renders as wins and stakes never inflate the Expenses rankings — a
+ * stake is a negative income row, a return is positive, and Torn's three-hour
+ * high-low table reads as one net line. The per-game `data` field names differ
+ * (v2 renamed them per game), so the amounts come from CASINO_LOGMAP below;
+ * this list is only what identifies a log as casino in the first place.
  */
 var CASINO_CAT_NAMES = [
   'Casino', 'Slots', 'Roulette', 'High-low', 'Keno', 'Craps', 'Lottery',
   'Blackjack', 'Spin the wheel', 'Russian roulette', 'Poker', 'Bookie',
 ];
+
+/**
+ * The generic casino net key. It expresses the v1 log API's shape — a win logs
+ * won_amount AND bet_amount, a loss only the bet — and is what the category
+ * rule writes as a GUESS, never as a considered choice. Two things read it as
+ * such: healLegacyGuesses_ replaces it with the verified per-game key below,
+ * and effectiveTypes_ treats a row still holding it as unconfigured.
+ */
+var CASINO_GUESS_KEY = 'won_amount?bet_amount';
+
+/**
+ * money_key values that are auto-guesses rather than choices: a row still
+ * holding one was never configured by hand, so effectiveTypes_ (parse.gs) may
+ * override it and healLegacyGuesses_ (setup.gs) may rewrite it.
+ */
+var STALE_GUESS_KEYS = {};
+STALE_GUESS_KEYS[CASINO_GUESS_KEY] = true;
+
+/**
+ * Verified v2 `data` shapes for casino log types, replacing the generic key
+ * above. The v2 log API renamed the fields per game, so the generic key matches
+ * nothing and every game except high-low's start landed in Exceptions; the
+ * category rule exists to keep casino money on one ledger line, not to spell
+ * out its fields.
+ *
+ * The accounting convention is unchanged (see CASINO_CAT_NAMES): money out when
+ * the stake leaves, money in for every gross amount that comes back, direction
+ * always `income` so a losing session shows as a negative income row instead of
+ * inflating the Expenses rankings. Nothing here is guessed — each entry is
+ * verified against live v2 dumps, and the arithmetic it produces is the check:
+ *   blackjack  bet 5000 -> winnings 10000                    = +5000 (even money)
+ *              bet 10000 -> winnings 25000, "with a natural" = +15000 (3:2)
+ *              => winnings is the GROSS return, so the stake is booked ONCE, at
+ *                 start; booking the lose log's `losses` too would double it.
+ *   craps      field 10000 -> winnings 20000                 = 2x (gross, again)
+ *              buy_9 10000 -> winnings 24500                 = 3:2 (15000) + stake
+ *                                                              less the 5% buy fee
+ *              come-out 7   -> winnings list the RETURNED stakes, losses the
+ *                              one that died, so bets = out and winnings = in.
+ *   high-low   bet_amount out at start; the rounds only grow the pot and the
+ *              payout lands on the cash-in (full = pot, half = floor(pot/2)),
+ *              so a busted game costs exactly the ante.
+ *   d: direction, k: the money_key ('' = the log moves no money)
+ *
+ * Types NOT in this table keep the generic guess and fail loudly into
+ * Exceptions — that is the point of the table, not an oversight. Still unknown
+ * (their RawLog rows carry no raw JSON): slots 8301 and roulette 8306 losses,
+ * and whether blackjack's push (8358) logs the returned stake. Get a shape with
+ * Torn > 5. Inspect a log type and the entry can be written.
+ */
+var CASINO_LOGMAP = {
+  '8310': { d: 'income', k: '-bet_amount' },   // high-low: the ante
+  '8311': { d: 'ignore', k: '' },              // round lost (pot bookkeeping)
+  '8312': { d: 'ignore', k: '' },              // round drawn
+  '8313': { d: 'ignore', k: '' },              // round won — pot grew, nothing paid
+  '8314': { d: 'income', k: 'pot' },           // cash in full
+  '8315': { d: 'income', k: 'pot/2' },         // cash in half (floored)
+  '8330': { d: 'income', k: '-sum:bets' },     // craps: the stakes
+  '8331': { d: 'income', k: 'sum:winnings' },  // craps: what came back
+  '8332': { d: 'ignore', k: '' },              // craps loss — already staked
+  '8340': { d: 'income', k: '-cost' },         // lottery ticket
+  '8350': { d: 'income', k: '-bet' },          // blackjack: the stake
+  '8351': { d: 'ignore', k: '' },              // blackjack hit
+  '8354': { d: 'ignore', k: '' },              // blackjack loss — stake already booked
+  '8355': { d: 'income', k: 'winnings' },      // blackjack win (gross return)
+  '8370': { d: 'income', k: '-cost' },         // spin the wheel ticket
+  '8374': { d: 'income', k: 'money' },         // spin the wheel win money
+  '8400': { d: 'income', k: 'refund' }         // russian roulette: leaving refunds the buy-in
+};
 
 /**
  * Category NAMES that move money (the four core ids above plus every extra
@@ -191,9 +257,16 @@ var TRANSFER_TYPES = {
  * mapping knowledge the TornCashflow userscript is built on). Format:
  *   id: { d: direction, b: bucket, k: optional money_key }
  *
- * Applied by refreshReference on new rows, and healed onto existing rows ONLY
- * while the row still holds the exact auto-guess this code would produce — a
- * deliberate user edit never matches the fresh guess, so it always survives.
+ * Applied on three paths, so the mapping cannot be lost between them:
+ *   - refreshReference writes it onto rows it builds, and heals rows that still
+ *     hold the old auto-guess (a direction you picked survives, and so does a
+ *     bucket you relabelled — the heal no longer requires the bucket to match
+ *     the current guess, which is what left drifted rows unhealable before);
+ *   - effectiveTypes_ fills it in at REBUILD time for any type whose sheet row
+ *     is missing or still unconfigured, so a mapping fix takes effect with no
+ *     sheet edit and no API call;
+ *   - the Exceptions safety net reads it to stay quiet about types whose money
+ *     fields it deliberately does not count (the d: 'ignore' entries below).
  *
  * Deliberate accounting choices mirrored from TornCashflow:
  *   - 4800 'Money sent' is a transfer (a gift out is not a loss), while
@@ -223,6 +296,7 @@ var REFERENCE_LOGMAP = {
   '7815': { d: 'income', b: 'Mission' },     // mission reward (credits not counted)
   '4810': { d: 'income', b: 'Other' },       // money received from a player
   '6811': { d: 'income', b: 'Faction' },     // faction payday received
+  '6710': { d: 'income', b: 'Bounties' },    // bounty claimed by you (bounty_reward)
   '1113': { d: 'income', b: 'ItemMarket' },  // item market sell (net proceeds)
   '1104': { d: 'income', b: 'ItemMarket' },  // legacy market sell
   '1226': { d: 'income', b: 'Bazaar' },      // bazaar sell
@@ -255,6 +329,10 @@ var REFERENCE_LOGMAP = {
   '5460': { d: 'transfer_out', b: 'Bank' },    // cashier's check sent half
   '6810': { d: 'transfer_out', b: 'Faction' }, // faction payday paid to a member
   // ---- deliberately not money for this ledger ----
+  // 'ignore' means the type carries money-ish fields but no money movement of
+  // YOURS, so the unmapped-money safety net must stay quiet.
+  '6711': { d: 'ignore', b: 'Bounties' },    // your bounty was claimed — the reward
+                                             // left the wallet when it was placed (6700)
   '6795': { d: 'ignore', b: 'Faction' },     // OC payout into the vault (vault math)
   '8166': { d: 'ignore', b: 'Attacks' },     // you got arrested (someone else's bounty)
   '5371': { d: 'ignore', b: 'Other' },       // someone else bailed you out
