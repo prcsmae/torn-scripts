@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Travel Planner
 // @namespace    http://tampermonkey.net/
-// @version      1.8
-// @description  Plan profitable travel routes using live abroad prices (YATA /api/v1/travel/export/) + Torn market values. Per-trip profit, budget allocation, suggested buy-list, active-window (short-haul) & sleep (long-haul) planning.
+// @version      1.9
+// @description  Plan profitable travel routes using live abroad prices (YATA /api/v1/travel/export/) + Torn market values. Hero card answers where to fly, when to leave (with a live countdown) and what to buy; route cards below for the rest. Budget allocation, catch-the-restock departures, sleep planning, item tracker, cash on hand from your API key.
 // @author       motherBarker (and China)
 // @match        https://www.torn.com/travelagency.php*
 // @match        https://www.torn.com/page.php?sid=travel*
@@ -17,6 +17,8 @@
 
 (function () {
   "use strict";
+  // v1.9: route-card UI (hero + cards), replacing the sortable table. See HELP_ITEMS
+  // for what every control does now.
 
   // ========== CONFIG ==========
   const CONFIG = {
@@ -212,7 +214,11 @@
           try {
             const data = JSON.parse(resp.responseText);
             if (data && data.error && typeof data.error === "object" && data.error.error) {
-              reject(new Error("API Error: " + data.error.error));
+              // Carry the Torn error code so callers can tell "key access too
+              // low" (16) from a real failure.
+              const err = new Error("API Error: " + data.error.error);
+              err.code = data.error.code;
+              reject(err);
             } else {
               resolve(data);
             }
@@ -269,25 +275,43 @@
     }
   }
 
-  // Current nerve from the user's own API key ('' = disabled).
-  async function fetchNerve(force) {
+  // Nerve comes from the bars selection, NOT basic: basic returns only
+  // level/gender/player_id/name/status, so the old `nerve.nerve` /
+  // `nerve_maximum` / `nerve_fulltime` reads were all undefined and the nerve
+  // warning could never fire. bars returns
+  // {current, maximum, increment, interval, ticktime, fulltime} (the last two
+  // are relative seconds, not timestamps).
+  function normalizeBars(data) {
+    const n = data && data.nerve;
+    if (!n || typeof n.current !== "number" || typeof n.maximum !== "number") return null;
+    const perNerveSec = n.increment > 0 && n.interval > 0 ? n.interval / n.increment : 300;
+    return {
+      nerve: n.current,
+      nerve_maximum: n.maximum,
+      // Unix seconds when the bar is full (nerveInfo wants an absolute time).
+      nerve_fulltime: Math.floor(Date.now() / 1000) + Math.max(0, (n.maximum - n.current) * perNerveSec),
+    };
+  }
+
+  async function fetchBars(force) {
     const key = state.apiKey;
     if (!key) return null;
     if (!force && ttpInBackoff()) return null; // cool-down after error, skip
-    const url = "https://api.torn.com/user/?selections=basic&key=" + encodeURIComponent(key);
+    const url = "https://api.torn.com/user/?selections=bars&key=" + encodeURIComponent(key);
     if (!force) {
       const cached = getCached(url);
       if (cached) return cached;
     }
     try {
       const data = await gmFetch(url);
-      if (!data || data.error || data.nerve == null) {
+      const bars = normalizeBars(data);
+      if (!bars) {
         ttpApiErr();
         return null;
       }
-      apiCache[url] = { data: data, ts: Date.now() };
+      apiCache[url] = { data: bars, ts: Date.now() };
       ttpApiOk();
-      return data;
+      return bars;
     } catch (e) {
       ttpApiErr();
       return null;
@@ -295,8 +319,60 @@
   }
 
   // Non-fatal: a missing/invalid API key must not break price/stock planning.
-  async function fetchNerveSafe(force) {
-    return (await fetchNerve(force)) || null;
+  async function fetchBarsSafe(force) {
+    return (await fetchBars(force)) || null;
+  }
+
+  // Money on hand. This is its OWN request: money needs at least Limited key
+  // access, and Torn answers error 16 for the whole response when one selection
+  // is out of reach, so sharing a request with bars would take the nerve read
+  // down with it. Returns {state, amount} with state one of
+  // ok | nokey | toolow | error (never throws).
+  function moneyOnHand(data) {
+    if (!data) return null;
+    if (typeof data.money_onhand === "number") return data.money_onhand;
+    if (typeof data.money === "number") return data.money;
+    if (data.money && typeof data.money.money_onhand === "number") return data.money.money_onhand;
+    return null;
+  }
+  let _cashKey = null; // key the cached access verdict was decided for
+  let _cash = { state: "nokey", amount: null };
+
+  async function fetchCash(force) {
+    const key = state.apiKey;
+    if (!key) return { state: "nokey", amount: null };
+    // A key that can't read money won't start being able to until it changes,
+    // so don't re-ask the API every refresh.
+    if (_cashKey === key && _cash.state === "toolow" && !force) return _cash;
+    const url = "https://api.torn.com/user/?selections=money&key=" + encodeURIComponent(key);
+    if (!force) {
+      const cached = getCached(url);
+      if (cached) {
+        _cashKey = key;
+        _cash = cached;
+        return cached;
+      }
+    }
+    let out;
+    try {
+      const data = await gmFetch(url);
+      const amount = moneyOnHand(data);
+      out = amount == null ? { state: "error", amount: null } : { state: "ok", amount: amount };
+    } catch (e) {
+      out = e && e.code === 16 ? { state: "toolow", amount: null } : { state: "error", amount: null };
+    }
+    _cashKey = key;
+    _cash = out;
+    if (out.state !== "error") apiCache[url] = { data: out, ts: Date.now() };
+    return out;
+  }
+
+  async function fetchCashSafe(force) {
+    try {
+      return await fetchCash(force);
+    } catch (e) {
+      return { state: "error", amount: null };
+    }
   }
 
   async function fetchItems(force) {
@@ -334,7 +410,7 @@
   const hours = (min) => {
     const h = Math.floor(min / 60),
       m = Math.round(min % 60);
-    return h > 0 ? h + "h " + (m ? m + "m" : "") : m + "m";
+    return h > 0 ? h + "h" + (m ? " " + m + "m" : "") : m + "m";
   };
   const pphStr = (n) => "$" + Math.round(n).toLocaleString() + "/h";
 
@@ -373,18 +449,42 @@
   const MAX_RESTOCKS = 40;
   const MEDIA_URL = "https://travel.mediabros.cc"; // shared 24/7 restock logger (Spud Travel backend)
 
+  // The history blob is hundreds of KB, and the planner reads it per item from
+  // inside nested loops, so JSON.parse-ing it on every lookup froze the tab for
+  // seconds on each settings change (measured: ~2.5s with a 4h-old history).
+  // Keep the parsed object in memory instead, and coalesce writes to one
+  // localStorage.setItem per second.
+  const HISTORY_FLUSH_MS = 1000;
+  let _history = null;
+  let _historyDirty = false;
+  let _historyFlushTimer = null;
   function getHistory() {
+    if (_history) return _history;
     try {
-      return JSON.parse(localStorage.getItem(HIST_KEY) || "{}");
+      _history = JSON.parse(localStorage.getItem(HIST_KEY) || "{}");
     } catch (e) {
-      return {};
+      _history = {};
     }
+    return _history;
   }
   function saveHistory(h) {
+    _history = h;
+    _historyDirty = true;
+    if (_historyFlushTimer) return;
+    _historyFlushTimer = setTimeout(() => {
+      _historyFlushTimer = null;
+      flushHistory();
+    }, HISTORY_FLUSH_MS);
+  }
+  // Write pending records out now (also called on tab hide/close so a pending
+  // change isn't lost between flushes).
+  function flushHistory() {
+    if (!_historyDirty || !_history) return;
+    _historyDirty = false;
     try {
-      localStorage.setItem(HIST_KEY, JSON.stringify(h));
+      localStorage.setItem(HIST_KEY, JSON.stringify(_history));
     } catch (e) {
-      /* ignore */
+      /* ignore (quota / private mode) */
     }
   }
 
@@ -1015,7 +1115,6 @@
       // --- Candidate items with real net profit, buying only what is in stock on arrival ---
       const arrivalMs = nowMs + oneWay * 60000;
       const cands = [];
-      const candsById = {};
       let rowDepart = null;
       for (const s of stock) {
         const it = items[s.id];
@@ -1045,44 +1144,127 @@
           s, // original feed entry - needed for departure planning
           entry,
         });
-        candsById[s.id] = cands[cands.length - 1];
       }
       cands.sort((a, b) => b.unitNet - a.unitNet);
 
-      // --- Budget allocation (greedy by unit net), capped by flight capacity ---
-      let remaining = state.budget;
-      const buyList = [];
-      let slotsUsed = 0;
-      for (const c of cands) {
-        if (remaining < 1) break;
-        const bySlots = cap - slotsUsed;
-        const perCap = Math.min(c.stockQty, cap);
-        const byBudget = Math.floor(remaining / c.cost);
-        const qty = Math.min(perCap, byBudget, bySlots);
-        if (qty <= 0) {
-          if (cap > 0 && slotsUsed >= cap) break; // flight capacity full
-          continue;
-        }
-        buyList.push({
-          id: c.id,
-          name: c.name,
-          qty,
-          cost: c.cost,
-          unitNet: c.unitNet,
-          profit: c.unitNet * qty,
-          spent: c.cost * qty,
-          landing: c.landing,
+      // --- Items you can only get by leaving LATER (land right after a restock) ---
+      // landingAvailability() calls these "empty at landing" (their restock lands
+      // after you would arrive now), so the arrival-now filter above threw them
+      // away, and departurePlan() is only consulted for items already in the buy
+      // list. The one function that can time a departure could therefore never see
+      // the item that needed it, which hid the most profitable item in the country
+      // from the table and scored each route on the leftovers. Japan: Xanax at
+      // +$100,248/unit was never mentioned, only the $437k Chopsticks plan.
+      const timedCands = [];
+      for (const s of stock) {
+        const it = items[s.id];
+        if (!it) continue;
+        if (it.tradeable === false) continue;
+        const mv = parseFloat(it.market_value);
+        if (!(mv > 0)) continue;
+        const received = mv * netPct;
+        const unitNet = received - s.cost;
+        if (unitNet <= 0) continue;
+        const entry = models && models[key] ? models[key][s.id] : null;
+        const dep = departurePlan(s, entry, nowMs, oneWay, key, state.stockWindow);
+        if (!dep || dep.status !== "timed") continue; // buyable on arrival is handled above
+        const lvl = dep.source ? dep.source.level : "low";
+        // Same confidence gate the out-of-stock path uses: never time a departure
+        // to a restock estimate we would not trust.
+        if (confRank(state.restockConfidence || "med") > confRank(lvl)) continue;
+        const shelf =
+          modelRestockQty(entry) ||
+          (typeof s.quantity === "number" && s.quantity > 0 ? s.quantity : cap * 3);
+        // Landing right after the restock, so nothing has sold out yet.
+        const qty = Math.floor(
+          restockSurvival(shelf, entry && entry.sellRate, dep.landAtMs, dep.landAtMs),
+        );
+        if (!(qty > 0)) continue;
+        timedCands.push({
+          id: s.id,
+          name: it.name || "#" + s.id,
+          stockQty: qty,
+          cost: s.cost,
+          received,
+          unitNet,
+          s,
+          entry,
+          departAtMs: dep.departAtMs,
+          landing: {
+            status: "restock",
+            qty,
+            timed: true, // catch it by leaving later
+            leaveAtMs: dep.departAtMs,
+            landAtMs: dep.landAtMs,
+            restockIn: Math.max(0, Math.round((dep.landAtMs - nowMs) / 60000)),
+            beforeLanding: 0,
+            conf: { level: lvl, label: dep.source ? dep.source.label : "low" },
+            note: "leave at " + localHHMM(dep.departAtMs) + " to land right after the restock",
+          },
         });
-        remaining -= c.cost * qty;
-        slotsUsed += qty;
+      }
+      timedCands.sort((a, b) => b.unitNet - a.unitNet);
+
+      // --- Budget allocation, capped by flight capacity ---
+      // Two greedy orders, keep the better list: unit-net order can strand a small
+      // budget on one expensive item, ROI order can leave slots empty with money
+      // unspent. The better of the two beats either alone (measured: Mexico on a
+      // $100k budget earned 18% more when the ROI order won).
+      function allocate(pool) {
+        const byUnit = [...pool].sort((a, b) => b.unitNet - a.unitNet);
+        const ratio = (c) => (c.cost > 0 ? c.unitNet / c.cost : Infinity);
+        const byRoi = [...pool].sort((a, b) => ratio(b) - ratio(a) || b.unitNet - a.unitNet);
+        let best = null;
+        for (const order of [byUnit, byRoi]) {
+          let remaining = state.budget;
+          let slots = 0;
+          const list = [];
+          for (const c of order) {
+            if (remaining < 1) break;
+            const perCap = Math.min(c.stockQty, cap);
+            const byBudget = Math.floor(remaining / c.cost);
+            const qty = Math.min(perCap, byBudget, cap - slots);
+            if (qty <= 0) {
+              if (cap > 0 && slots >= cap) break; // flight capacity full
+              continue;
+            }
+            list.push({
+              id: c.id,
+              name: c.name,
+              qty,
+              cost: c.cost,
+              unitNet: c.unitNet,
+              profit: c.unitNet * qty,
+              spent: c.cost * qty,
+              landing: c.landing,
+            });
+            remaining -= c.cost * qty;
+            slots += qty;
+          }
+          let profit = 0,
+            spend = 0;
+          for (const b of list) {
+            profit += b.profit;
+            spend += b.spent;
+          }
+          const plan = { buyList: list, tripProfit: profit, budgetSpent: spend, slots };
+          if (!best || plan.tripProfit > best.tripProfit) best = plan;
+        }
+        return best;
       }
 
-      let tripProfit = 0,
-        budgetSpent = 0;
-      for (const b of buyList) {
-        tripProfit += b.profit;
-        budgetSpent += b.spent;
-      }
+      // Catch a restock only when that earns more than buying what is on the shelf
+      // today; otherwise the plain arrival plan stands. This mirrors the
+      // now-vs-timed choice computeSleepPlan already makes.
+      const nowPlan = allocate(cands);
+      const timedPlan = timedCands.length ? allocate(timedCands) : null;
+      const useTimed =
+        !!timedPlan && timedPlan.tripProfit - travelCost > nowPlan.tripProfit - travelCost;
+      const pool = useTimed ? timedCands : cands;
+      const buyList = (useTimed ? timedPlan : nowPlan).buyList;
+      const tripProfit = (useTimed ? timedPlan : nowPlan).tripProfit;
+      const budgetSpent = (useTimed ? timedPlan : nowPlan).budgetSpent;
+      const slotsUsed = (useTimed ? timedPlan : nowPlan).slots;
       const tripProfitNet = tripProfit - travelCost; // after travel cost (only standard)
 
       const roundTripMin = 2 * oneWay + buffer; // in + out + buy buffer
@@ -1099,9 +1281,9 @@
       // trip-1 list repeats verbatim; without a depletion rate the flat
       // trips × trip-profit estimate is kept (no invented numbers).
       let windowProfit = trips * tripProfitNet;
-      if (trips > 1 && cands.length) {
+      if (trips > 1 && pool.length) {
         const sim = simulateWindowProfit(
-          cands,
+          pool,
           trips,
           roundTripMin,
           cap,
@@ -1115,10 +1297,14 @@
       const nrv = nerveInfo(roundTripMin, nerve);
 
       // Departure guidance: prefer an item that is buyable on arrival ("now");
-      // otherwise the earliest timed departure across the whole buy list.
+      // otherwise the earliest timed departure across the chosen buy list. When a
+      // timed plan won above, every item in it departs in the future, so the
+      // earliest one is what the Depart column shows.
+      const poolById = new Map();
+      for (const c of pool) poolById.set(c.id, c);
       let timedDepart = null;
       for (const b of buyList) {
-        const c0 = candsById[b.id];
+        const c0 = poolById.get(b.id);
         if (!c0) continue;
         const dep = departurePlan(c0.s, c0.entry, nowMs, oneWay, key, state.stockWindow);
         if (!dep) continue;
@@ -1134,6 +1320,7 @@
         key,
         name: dc.name,
         city: dc.city,
+        kind: useTimed ? "timed" : "now", // "timed" = leave later to catch a restock
         oneWay,
         travelCost,
         cap,
@@ -1429,16 +1616,37 @@
   }
 
   // ========== RENDER STATE ==========
-  let sortState = { key: null, dir: -1 }; // key from sortable columns; -1 desc
+  // Route cards replace the sortable table: the recommended route is the hero, every
+  // other route is a peer card, and sorting is one select instead of seven clickable
+  // column headers. The compute layer is untouched.
+  const SORTS = [
+    { key: "pph", label: "Profit per hour" },
+    { key: "tripProfitNet", label: "Profit per trip" },
+    { key: "windowProfit", label: "Window profit" },
+    { key: "departSort", label: "Leave time" },
+    { key: "budgetSpent", label: "Capital" },
+    { key: "roi", label: "Return on capital" },
+  ];
+  let sortMetric = null; // null = the planner's own ranking
+
   // Panel element refs
   let rootEl = null,
     panelBody = null,
-    controlsEl = null,
-    statusEl = null;
-  let summaryEl = null,
-    tableWrap = null; // eslint-disable-line no-unused-vars
+    statusEl = null,
+    ageEl = null; // "feed Ns old", the only node the 1s ticker rewrites
+  let summaryEl = null, // hero + sleep card
+    cardsEl = null, // route card list
+    cardsHeadEl = null, // count + sort control
+    sortSelEl = null,
+    chipsEl = null, // settings summary chips
+    settingsEl = null, // the collapsible control panel
+    settingsBtnEl = null;
+  let countdownEl = null, // hero countdown text
+    countdownTargetMs = null; // ms until the hero departure
   let miniButtonEl = null;
   let panelMinimized = false;
+  let cashTxtEl = null,
+    cashBtnEl = null; // cash-on-hand readout + "use it as capital" button
   // Tab + item tracker refs
   let plannerWrap = null,
     trackerWrap = null,
@@ -1447,282 +1655,371 @@
     trackSearchInp = null,
     tabBtnPlanner = null,
     tabBtnTracker = null;
+  // What the panel is showing right now, so loading and failure get real states
+  // instead of a blank where the answer should be.
+  let viewState = "idle"; // idle | loading | error
+  let viewMessage = "";
 
-  // Column definitions for the sortable table
-  const COLUMNS = [
-    { key: "name", label: "Destination" },
-    { key: "roundTripMin", label: "Time (RT)" },
-    { key: "tripProfitNet", label: "Trip profit" },
-    { key: "pph", label: "PPH" },
-    { key: "windowProfit", label: "Window profit" },
-    { key: "budgetSpent", label: "Budget spent" },
-    { key: "departSort", label: "Depart (local)" },
-  ];
-
+  // Item names come from the feed, so they never go into innerHTML raw.
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    }[c]));
+  }
+  // Money is the only thing that earns colour: green up, red down.
   function colorFor(v) {
-    return v >= 0 ? "#3fb950" : "#f85149";
+    return v >= 0 ? "var(--accent)" : "var(--neg)";
   }
-  // Pill badge for the buy-at-arrival status. cls: ok | wait | bad | mut.
+  // Status chip for a buy-list item. cls: ok | wait | bad | mut.
   function badge(text, cls, title) {
-    return `<span class="ttp-badge ${cls}"${title ? ` title="${title}"` : ""}>${text}</span>`;
+    return `<span class="ttp-badge ${cls}"${title ? ` title="${esc(title)}"` : ""}>${esc(text)}</span>`;
   }
+  // What the shelf will look like when you arrive. Every branch answers the same
+  // question ("can I buy it when I land, and if not, when?") in the same shape.
   function landingTag(ld) {
     if (!ld) return "";
     const conf = ld.conf ? ld.conf.label : "";
+    const confBit = conf && conf !== "high" ? ` <span class="ttp-conf">${esc(conf)}</span>` : "";
+    // Leave-later plan: the restock lands after you would arrive now, so the
+    // departure time is the actionable bit, not the arrival.
+    if (ld.status === "restock" && ld.timed) {
+      return badge("catch restock", "wait", ld.note + (conf ? " (" + conf + ")" : "")) + confBit;
+    }
     if (ld.status === "restock") {
       const before = ld.beforeLanding != null ? ld.beforeLanding : "?";
       const inMin = ld.restockIn != null ? ld.restockIn : "?";
-      // Post-arrival restock: beforeLanding is negative (or 0 when the
-      // restock coincides with landing); use the note instead.
       if (typeof before === "number" && before <= 0) {
         return (
-          badge("RESTOCKS +" + Math.max(1, -before) + "m AFTER LAND", "wait", "Restocks in ~" + inMin + "m from now (~" + -before + "m after you land) — " + conf) +
-          (conf ? ` <span class="ttp-conf">${conf}</span>` : "")
+          badge("restocks " + Math.max(1, -before) + "m after landing", "wait",
+            "Restocks in ~" + inMin + "m from now (~" + -before + "m after you land), " + conf) + confBit
         );
       }
       return (
-        badge("RESTOCKS ~" + before + "m BEFORE LAND", "wait", "Restocks in ~" + inMin + "m from now — " + conf) +
-        (conf ? ` <span class="ttp-conf">${conf}</span>` : "")
+        badge("restocks ~" + before + "m before landing", "wait",
+          "Restocks in ~" + inMin + "m from now, " + conf) + confBit
       );
     }
     if (ld.status === "instock" && ld.depletion) {
-      if (ld.depletion.sellsOutBeforeLand)
-        return badge("GONE ~" + ld.depletion.beforeLanding + "m BEFORE LAND", "bad", "In stock now, but predicted sold out ~" + ld.depletion.beforeLanding + "m before you land");
-      if (ld.depletion.beforeLanding != null)
-        return (
-          badge("IN STOCK", "ok") +
-          ` <span class="ttp-conf">sells out ~${ld.depletion.beforeLanding}m after you land</span>`
-        );
+      if (ld.depletion.sellsOutBeforeLand) {
+        return badge("gone before landing", "bad",
+          "In stock now, but predicted sold out ~" + ld.depletion.beforeLanding + "m before you land");
+      }
+      if (ld.depletion.beforeLanding != null) {
+        return badge("in stock", "ok") +
+          ` <span class="ttp-conf">sells out ~${ld.depletion.beforeLanding}m after you land</span>`;
+      }
     }
-    if (ld.status === "instock")
-      return badge("IN STOCK", "ok");
-    // empty with a useful note
-    if (ld.note && ld.note !== "empty at landing")
-      return badge("EMPTY", "bad", ld.note) + (conf ? ` <span class="ttp-conf">${conf}</span>` : "");
-    return badge("EMPTY", "bad");
+    if (ld.status === "instock") return badge("in stock", "ok");
+    if (ld.note && ld.note !== "empty at landing") return badge("empty", "bad", ld.note) + confBit;
+    return badge("empty", "bad");
+  }
+  // Compact chip version for a collapsed card.
+  function statusChip(row) {
+    const t0 = row.top.length ? row.top[0] : null;
+    const ld = t0 ? t0.landing : null;
+    if (ld && ld.status === "restock" && ld.timed) return badge("catch restock", "wait", "Leave later to land right after the restock");
+    if (ld && ld.status === "restock") return badge("restock at landing", "wait", "Refills around your arrival");
+    if (ld && ld.status === "instock") return badge("in stock", "ok", "On the shelf when you land");
+    if (ld && ld.status === "empty") return badge("empty", "bad", ld.note || "Not buyable when you land");
+    return "";
   }
 
-  // ========== SUMMARY (recommended route + sleep) ==========
-  function buildSummary(computed, sleep, nerve) {
+  // ========== HERO (the route to fly, with the countdown) ==========
+  function fmtCountdown(ms) {
+    const t = Math.max(0, Math.floor(ms / 1000));
+    const h = Math.floor(t / 3600),
+      m = Math.floor((t % 3600) / 60),
+      s = t % 60;
+    if (h > 0) return h + "h " + m + "m" + (t < 600 ? " " + s + "s" : "");
+    if (m > 0) return m + "m " + s + "s";
+    return s + "s";
+  }
+  // One text node, rewritten only when the string changes, and never while the
+  // panel is minimized or the tab is hidden.
+  function tickCountdown() {
+    if (!countdownEl || countdownTargetMs == null) return;
+    if (panelMinimized || (typeof document !== "undefined" && document.hidden)) return;
+    const left = countdownTargetMs - Date.now();
+    const txt = left <= 0 ? "leave now" : "in " + fmtCountdown(left);
+    if (txt !== countdownEl.textContent) countdownEl.textContent = txt;
+  }
+
+  function heroStats(row, computed) {
     const useWindow = computed.windowMin != null;
-    const best = computed.rows[0];
-    const second = computed.rows[1];
-    const topBuy =
-      best && best.top.length ? best.top.map((t) => t.name + " ×" + t.qty).join(", ") : "—";
+    const stats = [];
+    if (row.depart && row.depart.status === "timed") {
+      stats.push(
+        `<div class="ttp-stat"><span class="lbl">leave at</span>` +
+          `<span class="val clock" id="ttp-leave">${localHHMM(row.depart.departAtMs)}</span>` +
+          `<span class="rel" id="ttp-countdown"></span></div>`,
+      );
+    } else {
+      stats.push(
+        `<div class="ttp-stat"><span class="lbl">leave</span>` +
+          `<span class="val clock go" id="ttp-leave">now</span>` +
+          `<span class="rel" id="ttp-countdown"></span></div>`,
+      );
+    }
+    stats.push(
+      `<div class="ttp-stat"><span class="lbl">profit per trip</span>` +
+        `<span class="val pos">${signed(row.tripProfitNet)}</span></div>`,
+    );
+    stats.push(
+      `<div class="ttp-stat"><span class="lbl">per hour</span><span class="val sm">${pphStr(row.pph)}</span></div>`,
+    );
+    stats.push(
+      `<div class="ttp-stat"><span class="lbl">capital</span><span class="val sm">${money(row.budgetSpent)}</span>` +
+        `<span class="rel">ROI ${row.roi != null ? row.roi.toFixed(1) + "%" : "n/a"}</span></div>`,
+    );
+    if (useWindow) {
+      stats.push(
+        `<div class="ttp-stat"><span class="lbl">your ${hours(computed.windowMin)} window</span>` +
+          `<span class="val sm pos">${money(row.windowProfit)}</span>` +
+          `<span class="rel">${row.trips} trips back to back</span></div>`,
+      );
+    }
+    return stats.join("");
+  }
+
+  function buyListHtml(row) {
+    if (!row.buyList.length) return '<div class="ttp-muted">Nothing worth buying at this destination right now.</div>';
+    return (
+      '<ul class="ttp-buy">' +
+      row.buyList
+        .map(
+          (b) =>
+            `<li><span class="nm">${esc(b.name)}</span><span class="qty">x${b.qty}</span>` +
+            `<span class="cash">${money(b.spent)}</span><span class="cash pos">+${signed(b.unitNet)}</span>` +
+            `<span class="tag">${landingTag(b.landing)}</span></li>`,
+        )
+        .join("") +
+      "</ul>"
+    );
+  }
+
+  function buildHero(computed, sleep, nerve) {
+    const useWindow = computed.windowMin != null;
+    // A destination row exists even when it has nothing to buy, so the hero has to
+    // pick the best row that actually has a buy list, not just rows[0].
+    const best = computed.rows.filter((r) => r.buyList.length && r.tripProfitNet > 0)[0] || null;
     let html = "";
 
-    // Recommended active route
-    if (best) {
-      const metric = useWindow
-        ? money(best.windowProfit) +
-          " over " +
-          best.trips +
-          " trips in your " +
-          hours(computed.windowMin) +
-          " active window"
-        : signed(best.tripProfitNet) +
-          " per trip · " +
-          pphStr(best.pph) +
-          " · ROI " +
-          (best.roi != null ? best.roi.toFixed(1) + "%" : "—");
-      html += `<div class="ttp-reco" style="background:rgba(40,167,69,0.12);border:1px solid rgba(40,167,69,0.5);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
-      html += `<div style="font-weight:bold;color:#28a745;">★ Recommended route${useWindow ? " (active window)" : ""}</div>`;
-      html += `<div><b>${best.name} (${best.city})</b> — ${useWindow ? metric : ""}</div>`;
-      html += `<div style="color:#bbb;font-size:12px;">${useWindow ? "PPH " + pphStr(best.pph) + " · " : ""}RT ${hours(best.roundTripMin)} · Buy: ${topBuy}</div>`;
-      // Departure times live in the table's "Depart (local)" column — the
-      // recommended route is always the top row there, so no duplicate here.
-      if (second) {
-        html += `<div style="color:#bbb;font-size:12px;margin-top:4px;">Runner-up: <b>${second.name}</b> — ${signed(second.tripProfitNet)}/trip · ${pphStr(second.pph)}</div>`;
-      }
-      if (best && best.nerve && typeof best.nerve.now === "number") {
-        const n = best.nerve;
-        if (state.nerveCare && n.waste > state.nerveWasteLimit) {
-          const doSpend = Math.max(0, n.waste - state.nerveWasteLimit);
-          html += `<div style="color:#e2a03f;font-size:12px;margin-top:4px;">Nerve ${n.now}/${n.max} — this RT wastes <b>~${n.waste}</b> nerve. Spend <b>${doSpend}</b> (down to ~${n.spendTo}) before leaving to avoid capping mid-flight.</div>`;
-        }
-      }
-      html += `</div>`;
-    } else {
-      html += `<div style="color:#dc3545;padding:6px;">No profitable routes found with current net% / budget / capacity.</div>`;
+    if (!best) {
+      // Empty state: say which knob to loosen instead of showing nothing.
+      html +=
+        '<div class="ttp-hero ttp-hero-empty">' +
+        '<span class="ttp-kicker">no route to fly</span>' +
+        '<h2>Nothing clears a profit with these settings</h2>' +
+        '<p class="ttp-muted">Every candidate is either unprofitable after trading fees or will not be on the shelf when you land. ' +
+        "Try a bigger budget, a lower net % if your trades lose more than you think, or set Restock confidence to Low to see speculative routes.</p>" +
+        "</div>";
+      summaryEl.innerHTML = html;
+      countdownEl = null;
+      countdownTargetMs = null;
+      return;
     }
 
-    // Sleep plan — most profitable item that will be stocked when you land
+    const topBuy = best.top.length ? best.top.map((t) => esc(t.name) + " x" + t.qty).join(", ") : "n/a";
+    html += '<div class="ttp-hero">';
+    html += `<span class="ttp-kicker">fly this${useWindow ? " · active window" : ""}</span>`;
+    html +=
+      `<div class="ttp-hero-top"><h2>${esc(best.name)}<small>${esc(best.city)} · round trip ${hours(best.roundTripMin)} · ${best.slots}/${best.cap} slots</small></h2>` +
+      statusChip(best) +
+      "</div>";
+    html += `<div class="ttp-answer">${heroStats(best, computed)}</div>`;
+    html += `<div class="ttp-hero-buy"><span class="lbl">buy before you fly</span>${buyListHtml(best)}</div>`;
+    html += `<div class="ttp-hero-foot"><span>Headline: <b>${topBuy}</b></span>`;
+    if (best.travelCost) html += `<span>fare ${money(best.travelCost)}</span>`;
+    if (best.depart && best.depart.source && best.depart.source.label) {
+      html += `<span>restock data: ${esc(best.depart.source.label)}/${esc(best.depart.source.level || "-")}</span>`;
+    }
+    html += "</div>";
+    // Nerve warning, only when the user said they care.
+    if (best.nerve && typeof best.nerve.now === "number" && state.nerveCare && best.nerve.waste > state.nerveWasteLimit) {
+      const n = best.nerve;
+      const doSpend = Math.max(0, n.waste - state.nerveWasteLimit);
+      html += `<div class="ttp-warn">Nerve ${n.now}/${n.max}: this round trip wastes about ${n.waste} nerve. Spend ${doSpend} (down to about ${n.spendTo}) before leaving so you do not cap mid flight.</div>`;
+    }
+    html += "</div>";
+
+    // Sleep plan: a different decision (what is stocked when you wake), so its own card.
     if (sleep && sleep.rows.length) {
       const c = sleep.chosen;
-      const top =
-        c.top && c.top.length
-          ? c.top
-              .map(
-                (t) =>
-                  `${t.name} ×${t.qty}${t.after != null ? ` (${t.after}m after restock)` : ""}`,
-              )
-              .join(", ")
-          : "—";
+      const list = c.buyList.length
+        ? c.buyList
+            .map(
+              (b) =>
+                `<li><span class="nm">${esc(b.name)}</span><span class="qty">x${b.qty}</span>` +
+                `<span class="cash">${money(b.spent)}</span><span class="cash pos">+${signed(b.unitNet)}</span>` +
+                (b.after != null ? `<span class="tag">${b.after}m after restock</span>` : "") +
+                "</li>",
+            )
+            .join("")
+        : "";
       const timedPick = c.kind === "timed" && c.buyList[0] && c.buyList[0].dep != null;
-      const depItem = timedPick ? c.buyList[0] : null;
-      const confLbl =
-        depItem && depItem.conf && depItem.conf.level !== "high"
-          ? ` · <span style="color:#d29922;">${depItem.conf.label} confidence</span>`
-          : "";
-      const departTxt = timedPick
-        ? `Depart in <b>${hours(depItem.dep)}</b> — land <b>${depItem.after}m</b> after restock${confLbl}`
-        : "Depart <b>now</b> (stock verified at arrival)";
-      const fitsTxt =
-        state.sleepHours > 0
-          ? c.fits
-            ? `Fits your ${state.sleepHours}h sleep — set an alarm`
-            : `Arrival overruns your ${state.sleepHours}h sleep — will wake mid-trip`
-          : "Set sleep hours to time the restock";
-      html += `<div class="ttp-sleep" style="background:rgba(79,195,247,0.10);border:1px solid rgba(79,195,247,0.45);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
-      html += `<div style="font-weight:bold;color:#58a6ff;">Sleep plan — best item stocked at arrival</div>`;
-      html += `<div>Fly to <b>${c.name} (${c.city})</b> — one-way ${hours(c.oneWay)} · ${departTxt}</div>`;
-      html += `<div style="color:#bbb;font-size:12px;">${signed(c.profitNet)} net (spend ${money(c.budgetSpent)}, ${c.slots} slots) · Buy: ${top}</div>`;
-      html += `<div style="color:#bbb;font-size:12px;">${fitsTxt}</div>`;
+      html += '<div class="ttp-card ttp-sleep">';
+      html += '<span class="ttp-kicker">sleep plan</span>';
+      html += `<div class="ttp-hero-top"><h2>${esc(c.name)}<small>${esc(c.city)} · one way ${hours(c.oneWay)}</small></h2>` +
+        (c.fits ? badge("fits your sleep", "ok", "You will be awake before landing") : badge("wakes mid trip", "wait", "Arrival overruns your sleep hours")) +
+        "</div>";
+      html +=
+        '<div class="ttp-answer ttp-answer-sm">' +
+        `<div class="ttp-stat"><span class="lbl">${timedPick ? "depart in" : "leave"}</span><span class="val sm clock${timedPick ? "" : " go"}">${timedPick ? hours(c.buyList[0].dep) : "now"}</span>` +
+        (timedPick ? `<span class="rel">lands ${c.buyList[0].after}m after the restock</span>` : '<span class="rel">stock verified at arrival</span>') +
+        "</div>" +
+        `<div class="ttp-stat"><span class="lbl">profit</span><span class="val sm pos">${signed(c.profitNet)}</span></div>` +
+        `<div class="ttp-stat"><span class="lbl">spend</span><span class="val sm">${money(c.budgetSpent)}</span><span class="rel">${c.slots} slots</span></div>` +
+        "</div>";
+      if (list) html += `<div class="ttp-hero-buy"><span class="lbl">buy</span><ul class="ttp-buy">${list}</ul></div>`;
       if (sleep.rows.length > 1) {
-        html += `<div style="color:#888;font-size:11px;margin-top:3px;">Alternatives: ${sleep.rows
-          .slice(1, 4)
-          .map((r) => `${r.name} ${signed(r.profitNet)}${r.fits ? "" : " (over budget)"}`)
-          .join(" · ")}</div>`;
+        html +=
+          '<div class="ttp-hero-foot"><span>Also: ' +
+          sleep.rows
+            .slice(1, 4)
+            .map((r) => `${esc(r.name)} ${signed(r.profitNet)}${r.fits ? "" : " (over sleep)"}`)
+            .join(" · ") +
+          "</span></div>";
       }
-      html += `</div>`;
-    } else if (sleep && !sleep.rows.length) {
-      html += `<div class="ttp-sleep" style="background:rgba(79,195,247,0.10);border:1px solid rgba(79,195,247,0.45);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
-      html += `<div style="font-weight:bold;color:#58a6ff;">Sleep plan</div>`;
-      html += `<div style="color:#bbb;font-size:12px;">No item will be profitably in stock at any destination within your settings (budget/capacity/net%/restock confidence).</div>`;
-      html += `</div>`;
+      html += "</div>";
+    } else if (sleep) {
+      html +=
+        '<div class="ttp-card ttp-sleep"><span class="ttp-kicker">sleep plan</span>' +
+        '<div class="ttp-muted">No item is profitably in stock at any destination inside these settings, so there is nothing to time a wake up for.</div></div>';
     }
 
     summaryEl.innerHTML = html;
+    // arm the countdown for the hero departure
+    countdownEl = document.getElementById("ttp-countdown");
+    countdownTargetMs =
+      best.depart && best.depart.status === "timed" ? best.depart.departAtMs : null;
+    if (countdownEl && countdownTargetMs) tickCountdown();
+  }
+
+  // ========== ROUTE CARDS ==========
+  function buildCards(computed) {
+    // Only routes with something to buy get a card; the hero takes the best one.
+    const rows = computed.rows.filter((r) => r.buyList.length && r.tripProfitNet > 0).slice(1);
+    const metric = sortMetric || (computed.windowMin != null ? "windowProfit" : "pph");
+    const sorted = sortMetric
+      ? rows.slice().sort((a, b) => (b[metric] || 0) - (a[metric] || 0) || b.pph - a.pph)
+      : rows;
+    if (sortMetric === "departSort") sorted.sort((a, b) => a.departSort - b.departSort);
+
+    const head =
+      `<span class="ttp-count">${computed.rows.length} route${computed.rows.length === 1 ? "" : "s"}` +
+      `${computed.rows.length > 1 ? " · best first" : ""}</span>`;
+    cardsHeadEl.innerHTML =
+      head +
+      `<label class="ttp-sort"><span>sort</span><select id="ttp-sort-sel">` +
+      `<option value="">Recommended order</option>` +
+      SORTS.map((s) => `<option value="${s.key}"${sortMetric === s.key ? " selected" : ""}>${s.label}</option>`).join("") +
+      `</select></label>`;
+    sortSelEl = document.getElementById("ttp-sort-sel");
+    if (sortSelEl) {
+      sortSelEl.addEventListener("change", () => {
+        sortMetric = sortSelEl.value || null;
+        renderResults();
+      });
+    }
+
+    if (!sorted.length) {
+      cardsEl.innerHTML =
+        '<div class="ttp-muted">No other route is worth a trip right now. The hero above is the only one.</div>';
+      return;
+    }
+
+    cardsEl.innerHTML = sorted
+      .map((r) => {
+        const dep = r.depart
+          ? r.depart.status === "timed"
+            ? `<span class="leave">leave ${localHHMM(r.depart.departAtMs)}</span>`
+            : '<span class="leave go">leave now</span>'
+          : '<span class="leave dim">no window</span>';
+        const rowsHtml = r.buyList.length
+          ? '<ul class="ttp-buy">' +
+            r.buyList
+              .map(
+                (b) =>
+                  `<li><span class="nm">${esc(b.name)}</span><span class="qty">x${b.qty}</span>` +
+                  `<span class="cash">${money(b.spent)}</span><span class="cash pos">+${signed(b.unitNet)}</span>` +
+                  `<span class="cash">${signed(b.profit)}</span><span class="tag">${landingTag(b.landing)}</span></li>`,
+              )
+              .join("") +
+            "</ul>"
+          : '<div class="ttp-muted">No buy list.</div>';
+        return (
+          `<article class="ttp-route" tabindex="0" role="button" aria-expanded="false">` +
+          `<div class="ttp-route-top"><h3>${esc(r.name)}<small>${esc(r.city)}</small></h3>` +
+          `<span class="pph">${pphStr(r.pph)}</span></div>` +
+          `<div class="ttp-route-line">${dep}` +
+          `<span>${signed(r.tripProfitNet)} per trip</span>` +
+          `<span class="dim">${hours(r.roundTripMin)} round trip</span>` +
+          `<span class="dim">${money(r.budgetSpent)} capital</span>` +
+          statusChip(r) +
+          "</div>" +
+          `<div class="ttp-route-more">` +
+          rowsHtml +
+          `<div class="ttp-hero-foot"><span>ROI ${r.roi != null ? r.roi.toFixed(1) + "%" : "n/a"}</span>` +
+          `<span>${r.slots}/${r.cap} slots</span>` +
+          (computed.windowMin != null ? `<span>window ${signed(r.windowProfit)} over ${r.trips} trips</span>` : "") +
+          (r.travelCost ? `<span>fare ${money(r.travelCost)}</span>` : "") +
+          `</div></div></article>`
+        );
+      })
+      .join("");
+
+    cardsEl.querySelectorAll(".ttp-route").forEach((card) => {
+      const toggle = () => {
+        card.classList.toggle("open");
+        card.setAttribute("aria-expanded", card.classList.contains("open") ? "true" : "false");
+      };
+      card.addEventListener("click", toggle);
+      card.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+    });
+  }
+
+  // Loading and failure get their own card in the hero slot: a panel that says
+  // nothing while it works (or after it breaks) is worse than one that says so.
+  function buildPlaceholder(kind, message) {
+    const spinner = kind === "loading" ? '<span class="ttp-bars" aria-hidden="true"></span>' : "";
+    const title = kind === "loading" ? "Fetching live prices and stock" : "Could not load the planner data";
+    const body =
+      kind === "loading"
+        ? "Pulling abroad stock, restock cycles and market values, then scoring every route."
+        : esc(message || "The last request failed. Check your connection or API key and refresh.");
+    summaryEl.innerHTML =
+      `<div class="ttp-hero ttp-hero-${kind}">${spinner}<span class="ttp-kicker">${title}</span>` +
+      `<p class="ttp-muted">${body}</p>` +
+      (kind === "error" ? '<button class="ttp-btn" id="ttp-retry">Retry</button>' : "") +
+      "</div>";
+    cardsHeadEl.innerHTML = "";
+    cardsEl.innerHTML = "";
+    countdownEl = null;
+    countdownTargetMs = null;
+    const retry = document.getElementById("ttp-retry");
+    if (retry) retry.addEventListener("click", () => loadData(true));
   }
 
   function log(...a) {
     if (CONFIG.debug) console.log("[Travel Planner]", ...a);
   }
-
-  // ========== TABLE (sortable) ==========
-  function buildTable(computed) {
-    let rows = computed.rows.slice();
-    // Resolve sort key (default to windowProfit if window active, else pph)
-    const defKey = computed.windowMin != null ? "windowProfit" : "pph";
-    let k = sortState.key || defKey;
-    const dir = sortState.key ? sortState.dir : -1;
-    // numeric sort; name sorts alphabetically
-    rows.sort((a, b) => {
-      const va = a[k],
-        vb = b[k];
-      if (typeof va === "string") return dir * va.localeCompare(vb);
-      return dir * (va - vb || a.pph - b.pph);
-    });
-
-    let rowIdx = 0;
-    let html =
-      '<table class="ttp-table" style="width:100%;border-collapse:collapse;font-size:12px;">';
-    html += '<thead><tr style="border-bottom:1px solid rgba(255,255,255,0.15);text-align:left;">';
-    for (const c of COLUMNS) {
-      const active = (sortState.key || defKey) === c.key;
-      const arrow = active ? (dir === -1 ? " ▼" : " ▲") : "";
-      html += `<th data-key="${c.key}" style="padding:5px 6px;cursor:pointer;white-space:nowrap;color:${active ? "#4fc3f7" : "#aaa"};user-select:none;">${c.label}${arrow}</th>`;
-    }
-    html += '<th style="padding:5px 6px;color:#aaa;">Top items</th></tr></thead><tbody>';
-
-    for (const r of rows) {
-      const isBest = r === computed.rows[0];
-      const idx = rowIdx++;
-      html += `<tr class="ttp-row" data-idx="${idx}" style="border-bottom:1px solid rgba(255,255,255,0.06);${isBest ? "background:rgba(40,167,69,0.08);" : ""}cursor:pointer;">`;
-      html += `<td style="padding:5px 6px;"><b style="color:#f2f2f2;">${r.name}</b><br><span style="color:#c9c9c9;font-size:11px;">${r.city}</span></td>`;
-      html += `<td style="padding:5px 6px;white-space:nowrap;"><span style="color:#f2f2f2;font-weight:600;">${hours(r.roundTripMin)}</span><br><span style="color:#b7bdc5;font-size:11px;">1-way ${hours(r.oneWay)}${r.travelCost ? " · cost " + money(r.travelCost) : ""}</span></td>`;
-      html += `<td style="padding:5px 6px;white-space:nowrap;color:${colorFor(r.tripProfitNet)};font-weight:bold;">${signed(r.tripProfitNet)}</td>`;
-      html += `<td style="padding:5px 6px;white-space:nowrap;color:${colorFor(r.pph)};">${pphStr(r.pph)}</td>`;
-      html += `<td style="padding:5px 6px;white-space:nowrap;color:${colorFor(r.windowProfit)};">${computed.windowMin != null ? signed(r.windowProfit) + ' <span style="color:#888;font-size:11px;">(' + r.trips + "×)</span>" : "—"}</td>`;
-      html += `<td style="padding:5px 6px;white-space:nowrap;color:#aaa;">${money(r.budgetSpent)}</td>`;
-      // Depart (local): when to head to the airport for the headline item
-      {
-        let depHtml = '<span class="ttp-badge mut">—</span>';
-        if (r.depart) {
-          if (r.depart.status === "now") {
-            depHtml = badge("LEAVE NOW", "ok");
-          } else {
-            const inMin = Math.max(0, Math.round((r.depart.departAtMs - _ttpNow()) / 60000));
-            depHtml =
-              badge(localHHMM(r.depart.departAtMs), "wait") +
-              ` <span class="ttp-conf">in ${inMin}m</span>`;
-          }
-          if (r.depart.source && r.depart.source.label)
-            depHtml += ` <span class="ttp-conf">${r.depart.source.label}</span>`;
-        }
-        html += `<td style="padding:5px 6px;white-space:nowrap;">${depHtml}</td>`;
-      }
-      // Top 3 suggested items with qty + unit net
-      html += `<td style="padding:5px 6px;">`;
-      if (r.top.length) {
-        r.top.forEach((t, i) => {
-          html += `<div style="${i ? "margin-top:2px;" : ""}"><span style="color:#ddd;">${t.name}</span> <span style="color:#888;">×${t.qty}</span> <span style="color:${colorFor(t.unitNet)};font-size:11px;">@${signed(t.unitNet)}</span> ${landingTag(t.landing)}</div>`;
-        });
-        if (r.top.length < r.buyList.length)
-          html += `<div style="color:#888;font-size:11px;">+${r.buyList.length - r.top.length} more</div>`;
-      } else {
-        html += '<span style="color:#666;">—</span>';
-      }
-      html += `</td></tr>`;
-      // Expandable detail row: the FULL buy list with per-item profit lines.
-      const detail = r.buyList
-        .map(
-          (b) =>
-            `<tr><td style="padding:2px 6px;color:#c9d1d9;">${b.name}</td>` +
-            `<td style="padding:2px 6px;color:#c9d1d9;">×${b.qty}</td>` +
-            `<td style="padding:2px 6px;color:#8b949e;">@${money(b.cost)}</td>` +
-            `<td style="padding:2px 6px;color:${colorFor(b.unitNet)};">${signed(b.unitNet)}/u</td>` +
-            `<td style="padding:2px 6px;color:${colorFor(b.profit)};font-weight:600;">${signed(b.profit)}</td>` +
-            `<td style="padding:2px 6px;">${landingTag(b.landing)}</td></tr>`,
-        )
-        .join("");
-      html +=
-        `<tr class="ttp-detail" data-detail="${idx}" style="display:none;background:rgba(88,166,255,0.04);">` +
-        `<td colspan="7" style="padding:6px 18px;">` +
-        `<div style="color:#8b949e;font-size:11px;margin-bottom:2px;">Buy list — ${r.name} · spend ${money(r.budgetSpent)} · ${r.slots}/${r.cap} slots</div>` +
-        `<table style="width:100%;border-collapse:collapse;font-size:11px;">` +
-        `<thead><tr style="color:#8b949e;text-align:left;"><th style="padding:2px 6px;">Item</th><th style="padding:2px 6px;">Qty</th><th style="padding:2px 6px;">Buy</th><th style="padding:2px 6px;">Net/unit</th><th style="padding:2px 6px;">Profit</th><th style="padding:2px 6px;">Arrival</th></tr></thead>` +
-        `<tbody>${detail}</tbody></table></td></tr>`;
-    }
-    html += "</tbody></table>";
-    tableWrap.innerHTML = html;
-
-    // wire row clicks: toggle the per-item profit detail row
-    tableWrap.querySelectorAll("tr.ttp-row").forEach((tr) => {
-      tr.addEventListener("click", () => {
-        const d = tableWrap.querySelector(
-          'tr.ttp-detail[data-detail="' + tr.getAttribute("data-idx") + '"]',
-        );
-        if (d) d.style.display = d.style.display === "none" ? "" : "none";
-      });
-    });
-
-    // wire header clicks
-    tableWrap.querySelectorAll("th[data-key]").forEach((th) => {
-      th.addEventListener("click", () => {
-        const k2 = th.getAttribute("data-key");
-        if (sortState.key === k2) sortState.dir = -sortState.dir;
-        else {
-          sortState.key = k2;
-          sortState.dir = -1;
-        }
-        renderResults();
-      });
-    });
-  }
-
   // ========== RENDER ==========
   // ---- Tab switching ----
   // Shared tab styling: the active tab gets accent colors + underline so the
   // user always sees which view they're in.
   function applyTabStyles() {
-    const base =
-      "padding:6px 16px;border:1px solid #30363d;border-bottom:none;border-radius:6px 6px 0 0;font-size:12px;font-weight:bold;cursor:pointer;";
-    const active =
-      base + "background:#0d1117;color:#58a6ff;border-color:#58a6ff #30363d #0d1117;box-shadow:inset 0 2px 0 #58a6ff;";
-    const idle = base + "background:#161b22;color:#9aa4b2;";
-    if (tabBtnPlanner) tabBtnPlanner.style.cssText = state.tab === "planner" ? active : idle;
-    if (tabBtnTracker) tabBtnTracker.style.cssText = state.tab === "tracker" ? active : idle;
+    // Styling lives in the stylesheet; the markup only says which tab is current.
+    if (tabBtnPlanner) tabBtnPlanner.setAttribute("aria-current", state.tab === "planner" ? "true" : "false");
+    if (tabBtnTracker) tabBtnTracker.setAttribute("aria-current", state.tab === "tracker" ? "true" : "false");
   }
   function setTab(tab) {
     state.tab = tab === "tracker" ? "tracker" : "planner";
@@ -1793,8 +2090,20 @@
   }
 
   function renderResults() {
+    if (!summaryEl || !cardsEl || !cardsHeadEl) return;
+    if (viewState === "loading" && !lastData) {
+      buildPlaceholder("loading");
+      updateStatus();
+      return;
+    }
+    if (viewState === "error") {
+      buildPlaceholder("error", viewMessage);
+      updateStatus();
+      return;
+    }
     if (!lastData) {
-      if (statusEl) statusEl.textContent = "No data yet — click Refresh.";
+      buildPlaceholder("loading");
+      updateStatus();
       return;
     }
     let computed;
@@ -1806,53 +2115,55 @@
         lastData.nerve,
       );
     } catch (e) {
-      if (statusEl)
-        statusEl.innerHTML = '<span style="color:#dc3545;">Error: ' + (e.message || e) + "</span>";
+      buildPlaceholder("error", "Scoring the routes failed: " + (e.message || e));
       return;
     }
-    const sleep = sleepRecommendation(lastData.abroad, lastData.items, lastData.model || {});
-    buildSummary(computed, sleep, lastData.nerve);
-    buildTable(computed);
+    let sleep = null;
+    try {
+      sleep = sleepRecommendation(lastData.abroad, lastData.items, lastData.model || {});
+    } catch (e) {
+      sleep = null; // the sleep plan is a bonus, never a blocker
+    }
+    buildHero(computed, sleep, lastData.nerve);
+    buildCards(computed);
     updateItemOptions();
     buildTracker();
     updateStatus();
-    if (statusEl) statusEl.style.color = "#bbb";
+    updateCash();
   }
 
   function buildTracker() {
     if (!trackResultsEl) return;
-    // Chips (tracked items)
+    // Tracked item chips
     const chips = document.getElementById("ttp-track-chips");
     if (chips) {
       chips.innerHTML = "";
       if (!state.trackedItems.length) {
         const hint = document.createElement("span");
-        hint.style.cssText = "color:#9aa4b2;font-size:12px;";
-        hint.textContent = "Nothing tracked yet — search an item above and hit Track.";
+        hint.className = "ttp-muted";
+        hint.textContent = "Nothing tracked yet. Search an item above and hit Track.";
         chips.appendChild(hint);
       }
       for (const id of state.trackedItems) {
         const chip = document.createElement("span");
-        chip.style.cssText =
-          "display:inline-flex;align-items:center;gap:5px;background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2px 8px;font-size:11px;";
+        chip.className = "ttp-chip";
         const it = lastData && lastData.items[id];
         const nm = document.createElement("span");
         nm.textContent = it ? it.name : "#" + id;
         chip.appendChild(nm);
         const x = document.createElement("button");
+        x.type = "button";
         x.textContent = "×";
-        x.title = "Stop tracking";
-        x.style.cssText =
-          "background:none;border:none;color:#f85149;font-size:13px;cursor:pointer;padding:0;line-height:1;";
+        x.title = "Stop tracking " + (it ? it.name : "#" + id);
+        x.className = "ttp-chip-x";
         x.addEventListener("click", () => removeTrackedItem(id));
         chip.appendChild(x);
         chips.appendChild(chip);
       }
     }
-    // Results
     if (!lastData) {
       trackResultsEl.innerHTML =
-        '<div style="color:#9aa4b2;font-size:12px;">Click Refresh to load stock data first.</div>';
+        '<div class="ttp-muted">Hit Refresh to load stock data, then add an item to track.</div>';
       return;
     }
     if (!state.trackedItems.length) {
@@ -1862,54 +2173,85 @@
     const t = computeItemTimer(lastData.abroad, lastData.items, lastData.model || {});
     let html = "";
     for (const g of t.groups) {
-      html += `<div style="margin-bottom:10px;">`;
-      html += `<div style="font-weight:bold;color:#58a6ff;font-size:13px;">${g.name}</div>`;
+      html += `<div class="ttp-track-group"><h3>${esc(g.name)}</h3>`;
       if (!g.rows.length) {
-        html += `<div style="color:#9aa4b2;font-size:12px;">No usable restock window at any destination with your stock window + confidence settings.</div>`;
+        html +=
+          '<div class="ttp-muted">No usable restock window at any destination with your stock window and confidence settings.</div>';
       }
       for (const r of g.rows) {
         const qty = r.ld && r.ld.qty != null ? r.ld.qty : "?";
         const conf =
           r.ld && r.ld.conf && r.ld.conf.level !== "high"
-            ? ` · <span style="color:#d29922;">${r.ld.conf.label} confidence</span>`
+            ? `<span class="ttp-conf">${esc(r.ld.conf.label)}</span>`
             : "";
         const after =
           r.ld && r.ld.beforeLanding != null ? ` · ${Math.max(0, r.ld.beforeLanding)}m after restock` : "";
         const when =
           r.status === "now"
-            ? `Leave <b>now</b> — land in ${hours(r.oneWay)}`
-            : `Leave in <b>${hours(Math.max(0, (r.departAtMs - t.nowMs) / 60000))}</b> (at ${localHHMM(r.departAtMs)})`;
+            ? '<span class="leave go">leave now</span>'
+            : `<span class="leave">leave ${localHHMM(r.departAtMs)}</span>` +
+              ` <span class="dim">in ${hours(Math.max(0, (r.departAtMs - t.nowMs) / 60000))}</span>`;
         const net =
           r.unitNet != null
-            ? ` · <span style="color:${colorFor(r.unitNet)};">${signed(r.unitNet)}/unit</span>`
+            ? `<span style="color:${colorFor(r.unitNet)}">${signed(r.unitNet)}/unit</span>`
             : "";
-        html += `<div style="font-size:12px;margin-top:3px;"><b>${r.name}</b> — ${when} · ~${qty} on shelf${after}${net}${conf}</div>`;
+        html +=
+          `<div class="ttp-track-row"><b>${esc(r.name)}</b> <span class="dim">${esc(r.city)}</span> · ${when}` +
+          ` · <span class="dim">about ${qty} on the shelf${after}</span> ${net} ${conf}</div>`;
       }
-      html += `</div>`;
+      html += "</div>";
     }
     trackResultsEl.innerHTML = html;
   }
 
   function updateStatus() {
-    if (!lastData || !statusEl) return;
-    const age = lastData.fetchedAt
-      ? Math.max(0, Math.round((Date.now() - lastData.fetchedAt) / 1000))
-      : -1;
-    const mode =
-      state.mode.toUpperCase() +
-      " · cap " +
-      state.capacity +
-      " · net " +
-      state.netPct +
-      "% · budget " +
-      money(state.budget);
-    statusEl.innerHTML = `Data ${age >= 0 ? age + "s old" : "—"} · ${mode}`;
-    let suff = state.respectStock ? " · stock@arrival" : "";
-    if (lastData && lastData.nerve)
-      suff += " · nerve " + lastData.nerve.nerve + "/" + (lastData.nerve.nerve_maximum || 100);
-    if (suff) statusEl.innerHTML += suff;
+    if (!statusEl) return;
+    const age =
+      lastData && lastData.fetchedAt
+        ? Math.max(0, Math.round((Date.now() - lastData.fetchedAt) / 1000))
+        : -1;
+    let html = viewState === "loading" ? '<span class="ttp-loading">refreshing</span> · ' : "";
+    html += `<span id="ttp-age">feed ${age >= 0 ? age + "s old" : "not loaded"}</span>`;
+    if (lastData && lastData.nerve && typeof lastData.nerve.nerve === "number") {
+      html += ` · nerve ${lastData.nerve.nerve}/${lastData.nerve.nerve_maximum || 100}`;
+    }
+    statusEl.innerHTML = html;
+    ageEl = document.getElementById("ttp-age");
   }
 
+  // The 1s ticker rewrites two small text nodes and nothing else: the feed age and
+  // the hero countdown. It never re-renders the panel.
+  function tick() {
+    tickCountdown();
+    if (ageEl && lastData && lastData.fetchedAt) {
+      const s = Math.max(0, Math.round((Date.now() - lastData.fetchedAt) / 1000));
+      const txt = "feed " + s + "s old";
+      if (ageEl.textContent !== txt) ageEl.textContent = txt;
+    }
+  }
+
+  // Cash-on-hand readout. Every state is spelled out instead of leaving a blank,
+  // so a key that cannot read money says so rather than looking broken.
+  function updateCash() {
+    if (!cashTxtEl) return;
+    const c = lastData ? lastData.cash : null;
+    let text;
+    let canUse = false;
+    if (!c) text = "cash on hand: reading";
+    else if (c.state === "ok") {
+      text = "cash on hand: " + money(c.amount);
+      canUse = true;
+    } else if (c.state === "nokey") text = "cash on hand: add an API key to read it";
+    else if (c.state === "toolow") text = "cash on hand: this key cannot read money (needs Limited access)";
+    else text = "cash on hand: unavailable, hit Refresh to retry";
+    cashTxtEl.textContent = text;
+    if (cashBtnEl) {
+      cashBtnEl.disabled = !canUse;
+      cashBtnEl.title = canUse
+        ? "Set Budget (capital) to " + money(c.amount)
+        : "Reads money on hand from your API key. Needs money access on the key.";
+    }
+  }
   // ========== LOAD / REFRESH ==========
   async function loadData(force) {
     if (loading) return;
@@ -1920,18 +2262,21 @@
     const btn = document.getElementById("ttp-refresh");
     if (btn) {
       btn.disabled = true;
-      btn.textContent = "⏳ Loading…";
+      btn.textContent = "Loading";
     }
-    if (statusEl)
-      statusEl.innerHTML =
-        '<span style="color:#58a6ff;">⏳ Fetching abroad prices + item values + restock/nerve…</span>';
+    viewState = "loading";
+    // Only blank the panel on a first load. On a refresh the old numbers stay up,
+    // because stale numbers beat no numbers.
+    if (!lastData) renderResults();
+    else updateStatus();
 
     try {
-      const [abroad, items, model, nerve, backend] = await Promise.all([
+      const [abroad, items, model, nerve, cash, backend] = await Promise.all([
         fetchAbroad(force),
         fetchItems(force),
         fetchModelSafe(force),
-        fetchNerveSafe(force),
+        fetchBarsSafe(force),
+        fetchCashSafe(force),
         fetchBackend(force),
       ]);
       if (seq !== updateSeq) return;
@@ -1942,15 +2287,20 @@
         items: itemMap,
         model,
         nerve,
+        cash,
         fetchedAt: Date.now(),
       };
       _backend = backend; // shared 24/7 restock predictions (may be null)
       recordSnapshot(abroad); // feed the locally-learned restock history
+      viewState = "idle";
+      viewMessage = "";
       renderResults();
     } catch (e) {
       if (seq !== updateSeq) return;
-      if (statusEl)
-        statusEl.innerHTML = '<span style="color:#dc3545;">' + (e.message || e) + "</span>";
+      viewState = "error";
+      viewMessage = e && e.message ? e.message : String(e);
+      renderResults(); // an error card with a Retry button, not a red line
+      updateCash(); // don't leave the readout stuck on "reading"
     } finally {
       loading = false;
       if (seq === updateSeq) {
@@ -1959,12 +2309,14 @@
           b.disabled = false;
           b.textContent = "Refresh";
         }
+        updateStatus(); // clears the "refreshing" marker
       }
     }
   }
 
   function onSettingsChange() {
     saveState();
+    updateChips(); // the chip strip mirrors the settings it just changed
     if (lastData)
       renderResults(); // recompute from cache, no refetch
     else updateStatus();
@@ -2033,9 +2385,9 @@
     });
     return inp;
   }
-  // Budget input: accepts short-hand (2k / 2m / 1.5b), commas while typing and
-  // plain numbers. Comma-formats on commit; invalid text shows an inline error
-  // and reverts to the last good value.
+  // Budget input: accepts short-hand (2k / 2m / 1.5b), commas and plain numbers.
+  // Commas appear as you type; invalid text shows an inline error and reverts to
+  // the last good value on commit.
   function parseMoney(raw) {
     if (raw == null) return null;
     const s = String(raw).trim().replace(/[,\s_]/g, "");
@@ -2045,6 +2397,32 @@
     const mult = m[2] ? { k: 1e3, m: 1e6, b: 1e9 }[m[2].toLowerCase()] : 1;
     const v = Math.round(parseFloat(m[1]) * mult);
     return isFinite(v) && v >= 0 ? v : null;
+  }
+  // Group a digit run in threes. String-based on purpose: a 19-digit amount
+  // would lose its tail if it went through Number first.
+  function groupDigits(digits) {
+    return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  }
+  // Re-group what the user is typing and say where the caret goes back to: it
+  // stays after the same digit it was after before the commas moved. Pure, so
+  // the harness can check the caret math.
+  function formatMoneyTyping(raw, caret) {
+    const s = String(raw);
+    const upTo = s.slice(0, caret == null ? s.length : caret);
+    const at = upTo.replace(/\D/g, "").length; // digits left of the caret
+    let digits = s.replace(/\D/g, "");
+    if (digits.length > 1) digits = digits.replace(/^0+/, ""); // no 0001234
+    if (!digits) return { text: "", caret: 0 };
+    const text = groupDigits(digits);
+    if (at <= 0) return { text, caret: 0 };
+    let seen = 0,
+      pos = 0;
+    while (pos < text.length) {
+      if (/\d/.test(text[pos])) seen++;
+      pos++;
+      if (seen === at) break;
+    }
+    return { text, caret: pos };
   }
   function moneyInput(value, onchange, w) {
     const inp = document.createElement("input");
@@ -2058,6 +2436,16 @@
     let lastValid = typeof value === "number" && isFinite(value) ? value : null;
     const fmt = (v) => (v == null ? "" : v.toLocaleString("en-US"));
     inp.addEventListener("input", () => {
+      const raw = inp.value;
+      // Plain numbers get grouped live; shorthand (2k / 1.5b) is left alone so
+      // the k/m/b can still be typed.
+      if (raw && !/[a-z]/i.test(raw) && raw.indexOf(".") === -1) {
+        const f = formatMoneyTyping(raw, inp.selectionStart);
+        if (f.text !== raw) {
+          inp.value = f.text;
+          inp.setSelectionRange(f.caret, f.caret);
+        }
+      }
       if (inp.value.trim() === "") {
         if (inp.__setErr) inp.__setErr("Enter an amount (e.g. 2m or 2,000,000)");
         return;
@@ -2081,31 +2469,35 @@
     return inp;
   }
   // "?" header button → modal explaining every control.
+  // "?" header button opens a modal explaining every control.
   const HELP_ITEMS = [
-    ["Travel method", "Flight class. Airstrip / WLT / Business are FREE and faster; only Standard pays the fare shown per destination."],
+    ["Travel method", "Flight class. Airstrip, WLT and Business are free and faster. Only Standard pays the fare shown per destination."],
     ["Item capacity", "How many items you can carry home in one trip."],
     ["Net % (trade)", "Percent of market value you actually receive when selling. 97 is typical."],
-    ["Budget (capital)", "Money you're willing to spend per trip. Short-hand works: 2m = 2,000,000, 2k = 2,000, 1.5b = 1,500,000,000. Commas are fine."],
-    ["Buy buffer (min)", "Minutes you'll realistically spend shopping after landing. Items predicted to sell out before you finish buying are skipped."],
-    ["Active start / end", "Your awake window. Departure times and active-window recommendations target this period; 'Now' sets start to the current time."],
-    ["Sleep (h)", "Hours you'll be asleep — the sleep plan times a departure so the best item is freshly restocked when you wake up."],
-    ["Stock on arrival", "Only recommend items that will actually be on the shelf when you land (respects depletion + restock timing)."],
-    ["Stock window (min)", "Land ~N minutes AFTER a restock. Negative (default) = land as soon as possible after the restock. Restocks older than this window before landing are treated as already sold out."],
-    ["Restock confidence", "Minimum trust level for restock predictions (live PromBot data / restock model). Lower = more speculative routes shown."],
-    ["Nerve waste", "Tick the box if you care about nerve capping mid-flight. When on, warns if the round trip wastes more than N nerve and suggests how much to spend first."],
-    ["Item tracker (tab)", "Track up to 10 specific items and get exact leave-times: for each destination stocking the item, when to depart so it's freshly restocked (per your stock window) at arrival, with expected shelf size and net per unit."],
-    ["API key", "Optional Torn API key (items + nerve). Needed for the nerve-waste estimate; stored locally in your browser only."],
+    ["Budget (capital)", "Money you are willing to spend per trip. Short-hand works: 2m = 2,000,000, 1.5b = 1,500,000,000. Commas appear as you type. Use my money copies your cash on hand from the API key."],
+    ["Active start / end", "Your awake window. Leave times and the window profit target this period. Now sets start to the current time."],
+    ["Sleep (h)", "Hours you will be asleep. The sleep plan times a departure so the best item is freshly restocked when you wake."],
+    ["Buy buffer (min)", "Minutes you realistically spend buying after landing."],
+    ["Stock window (min)", "Aim to land this many minutes after a restock. Negative means as soon as possible after it."],
+    ["Restock confidence", "Minimum trust level for restock predictions. Low shows more speculative routes."],
+    ["Stock at landing", "On: only buy items that will still be on the shelf when you land. Off: also count items predicted to sell out while you are in the air."],
+    ["Nerve waste", "Tick it if you care about nerve capping mid flight, then set the threshold. It warns when a round trip wastes that much nerve and says how much to spend first."],
+    ["API key", "Your Torn API key. Reads market values, your nerve bar and your cash on hand. Money needs at least Limited access, market values and nerve work on a minimal key. Stored in your browser only."],
     ["Auto-refresh", "Re-fetch live prices and restock data every 10 minutes."],
+    ["Settings button", "The chips above the hero show your settings at a glance. Settings opens the form, Hide settings closes it."],
+    ["Route cards", "The hero card is the route to fly. Every other route is a card below. Tap or press Enter on a card for its full buy list, capital, ROI and slots."],
+    ["Leave at", "Now means the item is on the shelf when you land. A clock time means leave then to land right after a restock, and the hero counts down to it. Catch restock marks those items."],
+    ["Item tracker (tab)", "Track up to 10 items and get an exact leave time for every destination that stocks them."],
   ];
   const HELP_FLOW = [
-    ["Set your trip basics", "Pick a travel method (Airstrip / WLT / Business are free and fast), then enter your item capacity, net % (97 is typical for trades) and how much money you want to spend per trip."],
-    ["Tell it when you're awake", "Set your active start/end times and, if you like, how many hours you'll sleep. Departure times and recommendations are timed around this."],
-    ["Hit Refresh", "The script pulls live foreign stock, restock cycles and prices, then scores every destination by profit per hour."],
-    ["Pick a route from the table", "The highlighted row is the best route right now. Every row shows round-trip time, profit, profit-per-hour and departure times so you know exactly when to leave."],
-    ["Read the stock badges", "IN STOCK = on the shelf when you land. RESTOCKS = item refills near your arrival (timing shown). EMPTY / GONE = don't bother — it won't be there."],
-    ["Optional: sleep plan", "Enter your sleep hours and the planner times a departure so the best item is freshly restocked exactly when you wake up."],
-    ["Optional: nerve + API key", "Tick Nerve waste and add an API key to get a warning when a round trip would waste nerve, plus how much to spend before flying."],
-    ["Optional: item tracker", "Switch to the Item tracker tab, search for items you're hunting, and it tells you exactly when to leave for each destination so they're freshly restocked when you land."],
+    ["Set your trip basics", "Pick a travel method, then enter capacity, net % and the money you want to spend per trip."],
+    ["Tell it when you are awake", "Set your active window and, if you like, how many hours you sleep. Departure times are timed around it."],
+    ["Hit Refresh", "The script pulls live foreign stock, restock cycles and market values, then scores every route."],
+    ["Read the hero card", "It answers the only three questions: where to fly, when to leave, and what to buy. If the leave time is a clock time, it counts down."],
+    ["Check the other routes", "Cards below the hero are the alternatives, best first. Open one for its full buy list and arrival status."],
+    ["Optional: sleep plan", "Fill in sleep hours and a second card times a departure so the best item is freshly restocked when you wake."],
+    ["Optional: cash and nerve", "Paste an API key to see your cash on hand (one button copies it into Budget) and nerve, which warns when a round trip would cap it."],
+    ["Optional: item tracker", "Switch to Item tracker, search for an item, and it tells you when to leave for each destination that stocks it."],
   ];
   function showHelp() {
     const old = document.getElementById("ttp-help");
@@ -2115,31 +2507,33 @@
     }
     const ov = document.createElement("div");
     ov.id = "ttp-help";
-    ov.className = "ttp-help-ov";
+    const close = () => {
+      ov.remove();
+      document.removeEventListener("keydown", onKey);
+    };
+    // Escape has to close it: the click-outside path alone leaves keyboard users stuck.
+    const onKey = (e) => {
+      if (e.key === "Escape") close();
+    };
+    document.addEventListener("keydown", onKey);
     ov.addEventListener("click", (e) => {
-      if (e.target === ov) ov.remove();
+      if (e.target === ov) close();
     });
     const card = document.createElement("div");
     card.className = "ttp-help-card";
     const h = document.createElement("h3");
-    h.textContent = "Travel Planner — how to use";
-    const close = document.createElement("button");
-    close.className = "ttp-input";
-    close.textContent = "Close";
-    close.style.cssText = "margin-top:10px;cursor:pointer;";
-    close.addEventListener("click", () => ov.remove());
+    h.textContent = "Travel planner: how to use";
     card.appendChild(h);
-    // Step-by-step flow
-    const fh = document.createElement("div");
-    fh.className = "h-sec";
-    fh.textContent = "The flow";
-    card.appendChild(fh);
+    const flowHead = document.createElement("div");
+    flowHead.className = "h-sec";
+    flowHead.textContent = "The flow";
+    card.appendChild(flowHead);
     HELP_FLOW.forEach(([k, d], i) => {
       const row = document.createElement("div");
       row.className = "h-row";
       const key = document.createElement("span");
       key.className = "h-k";
-      key.textContent = i + 1 + ". " + k + " — ";
+      key.textContent = i + 1 + ". " + k + " ";
       const desc = document.createElement("span");
       desc.className = "h-d";
       desc.textContent = d;
@@ -2147,17 +2541,16 @@
       row.appendChild(desc);
       card.appendChild(row);
     });
-    // Field reference
-    const rh = document.createElement("div");
-    rh.className = "h-sec";
-    rh.textContent = "Settings reference";
-    card.appendChild(rh);
+    const refHead = document.createElement("div");
+    refHead.className = "h-sec";
+    refHead.textContent = "Settings reference";
+    card.appendChild(refHead);
     for (const [k, d] of HELP_ITEMS) {
       const row = document.createElement("div");
       row.className = "h-row";
       const key = document.createElement("span");
       key.className = "h-k";
-      key.textContent = k + " — ";
+      key.textContent = k + ": ";
       const desc = document.createElement("span");
       desc.className = "h-d";
       desc.textContent = d;
@@ -2165,9 +2558,31 @@
       row.appendChild(desc);
       card.appendChild(row);
     }
-    card.appendChild(close);
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "ttp-btn";
+    closeBtn.textContent = "Close";
+    closeBtn.addEventListener("click", close);
+    card.appendChild(closeBtn);
     ov.appendChild(card);
     document.body.appendChild(ov);
+    closeBtn.focus();
+  }
+
+  // Chips: the settings you can see at a glance. They change rarely, the answer
+  // changes constantly, so the answer gets the space and these stay one line.
+  function updateChips() {
+    if (!chipsEl) return;
+    const items = [
+      state.mode.charAt(0).toUpperCase() + state.mode.slice(1),
+      state.capacity + " slots",
+      "net " + state.netPct + "%",
+      "budget " + money(state.budget),
+      state.respectStock ? "stock at landing" : "stock ignored",
+      (state.restockConfidence || "med") + " confidence",
+      state.activeEnd ? "window " + state.activeStart + " to " + state.activeEnd : "no active window",
+    ];
+    chipsEl.innerHTML = items.map((c) => `<span class="ttp-chip">${esc(c)}</span>`).join("");
   }
 
   function buildPanel() {
@@ -2177,53 +2592,46 @@
       panelBody = document.getElementById("ttp-body");
       statusEl = document.getElementById("ttp-status");
       summaryEl = document.getElementById("ttp-summary");
-      tableWrap = document.getElementById("ttp-table");
-      controlsEl = document.getElementById("ttp-controls");
+      cardsEl = document.getElementById("ttp-cards");
+      cardsHeadEl = document.getElementById("ttp-cards-head");
+      chipsEl = document.getElementById("ttp-chips");
+      settingsEl = document.getElementById("ttp-settings");
+      settingsBtnEl = document.getElementById("ttp-settings-btn");
       return;
     }
 
     const container = document.createElement("div");
     container.id = "ttp-root";
-    container.style.cssText =
-      "position:fixed;top:20px;left:50%;transform:translateX(-50%);" +
-      "z-index:99999;width:min(1150px,96vw);max-height:calc(100vh - 40px);" +
-      "background:#0d1117;color:#fff;border:1px solid #30363d;border-radius:8px;" +
-      "display:flex;flex-direction:column;box-sizing:border-box;" +
-      "box-shadow:0 6px 24px rgba(0,0,0,0.7);overflow-y:auto;overflow-x:auto;" +
-      "font-family:Arial,sans-serif;font-size:13px;";
     rootEl = container;
 
     const header = document.createElement("div");
     header.id = "ttp-header";
-    header.style.cssText =
-      "display:flex;align-items:center;justify-content:space-between;padding:9px 14px;background:#161b22;border-bottom:1px solid #30363d;cursor:grab;user-select:none;";
     const title = document.createElement("span");
-    title.style.cssText = "font-weight:bold;font-size:15px;color:#58a6ff;display:inline-flex;align-items:center;gap:7px;";
+    title.className = "ttp-title";
     title.innerHTML =
       '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">' +
       '<path fill="currentColor" d="M21.5 15.5 13.5 11V5.5A1.5 1.5 0 0 0 12 4a1.5 1.5 0 0 0-1.5 1.5V11l-8 4.5V17l8-2.5v5L8.5 21v1l3.5-1 3.5 1v-1l-2-1.5v-5l8 2.5v-1.5Z"/>' +
       "</svg>";
-    title.appendChild(document.createTextNode("Torn Travel Planner"));
+    title.appendChild(document.createTextNode("Travel planner"));
     const btns = document.createElement("div");
-    btns.style.cssText = "display:flex;gap:6px;";
-    const minBtn = document.createElement("button");
-    minBtn.className = "ttp-min";
-    minBtn.textContent = "–";
-    minBtn.title = "Minimize";
-    minBtn.style.cssText = btnStyle();
-    minBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      setMinimized(!panelMinimized);
-    });
+    btns.className = "ttp-head-btns";
     const helpBtn = document.createElement("button");
-    helpBtn.className = "ttp-helpbtn";
+    helpBtn.type = "button";
+    helpBtn.className = "ttp-icon-btn";
     helpBtn.textContent = "?";
-    helpBtn.title = "How to use the travel planner";
-    helpBtn.style.cssText =
-      "background:#21262d;color:#e6edf3;border:1px solid #6e7681;border-radius:50%;width:22px;height:22px;font-size:13px;font-weight:bold;line-height:1;padding:0;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;";
+    helpBtn.title = "How to use the planner";
     helpBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       showHelp();
+    });
+    const minBtn = document.createElement("button");
+    minBtn.type = "button";
+    minBtn.className = "ttp-icon-btn ttp-min";
+    minBtn.textContent = "–";
+    minBtn.title = "Minimize to the side button";
+    minBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      setMinimized(!panelMinimized);
     });
     btns.appendChild(helpBtn);
     btns.appendChild(minBtn);
@@ -2231,15 +2639,16 @@
     header.appendChild(btns);
     container.appendChild(header);
 
-    // Drag
+    // Drag by the header. Any control inside it is excluded.
     let dragging = false,
       dx = 0,
       dy = 0;
     header.addEventListener("mousedown", (e) => {
       if (e.target.closest("button")) return;
       dragging = true;
-      dx = e.clientX - container.getBoundingClientRect().left;
-      dy = e.clientY - container.getBoundingClientRect().top;
+      const box = container.getBoundingClientRect();
+      dx = e.clientX - box.left;
+      dy = e.clientY - box.top;
       e.preventDefault();
     });
     document.addEventListener("mousemove", (e) => {
@@ -2252,20 +2661,61 @@
       dragging = false;
     });
 
-    // Body
     const body = document.createElement("div");
     body.id = "ttp-body";
-    body.style.cssText = "display:block;padding:12px 14px;";
     panelBody = body;
 
-    // Controls
+    // Tabs: the planner and the item tracker are two different questions.
+    const tabBar = document.createElement("div");
+    tabBar.className = "ttp-tabs";
+    function tabBtn(label, key) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "ttp-tab";
+      b.textContent = label;
+      b.addEventListener("click", () => setTab(key));
+      return b;
+    }
+    tabBtnPlanner = tabBtn("Routes", "planner");
+    tabBtnTracker = tabBtn("Item tracker", "tracker");
+    tabBar.appendChild(tabBtnPlanner);
+    tabBar.appendChild(tabBtnTracker);
+    body.appendChild(tabBar);
+
+    // ---- planner view ----
+    plannerWrap = document.createElement("div");
+    plannerWrap.className = "ttp-view";
+
+    const chipsWrap = document.createElement("div");
+    chipsWrap.className = "ttp-chips";
+    // The chip row is the node updateChips() rewrites, so the button lives beside it
+    // in the wrapper: writing innerHTML over a container destroys its other children.
+    const chips = document.createElement("div");
+    chips.id = "ttp-chips";
+    chips.className = "ttp-chip-row";
+    chipsEl = chips;
+    chipsWrap.appendChild(chips);
+    settingsBtnEl = document.createElement("button");
+    settingsBtnEl.type = "button";
+    settingsBtnEl.id = "ttp-settings-btn";
+    settingsBtnEl.className = "ttp-btn ttp-settings-btn";
+    settingsBtnEl.textContent = "Settings";
+    settingsBtnEl.setAttribute("aria-expanded", "false");
+    settingsBtnEl.addEventListener("click", () => {
+      const open = settingsEl.classList.toggle("open");
+      settingsBtnEl.setAttribute("aria-expanded", open ? "true" : "false");
+      settingsBtnEl.textContent = open ? "Hide settings" : "Settings";
+    });
+    chipsWrap.appendChild(settingsBtnEl);
+    plannerWrap.appendChild(chipsWrap);
+
     const ctl = document.createElement("div");
-    ctl.id = "ttp-controls";
-    ctl.style.cssText =
-      "display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;background:rgba(255,255,255,0.04);padding:8px 10px;border-radius:6px;";
-    controlsEl = ctl;
+    ctl.id = "ttp-settings";
+    ctl.className = "ttp-settings";
+    settingsEl = ctl;
 
     const modeSel = document.createElement("select");
+    modeSel.className = "ttp-sel";
     ["airstrip", "standard", "wlt", "business"].forEach((m) => {
       const o = document.createElement("option");
       o.value = m;
@@ -2273,7 +2723,6 @@
       modeSel.appendChild(o);
     });
     modeSel.value = state.mode;
-    modeSel.className = "ttp-sel";
     modeSel.addEventListener("change", () => {
       state.mode = modeSel.value;
       if (!state.capacityOverridden) {
@@ -2306,10 +2755,41 @@
       "60px",
       { max: 100, title: "Percent of market value you actually receive when selling" },
     );
-    const budInp = moneyInput(state.budget, (v) => {
-      state.budget = v;
+    const budInp = moneyInput(
+      state.budget,
+      (v) => {
+        state.budget = v;
+        onSettingsChange();
+      },
+      "110px",
+    );
+    // Cash on hand from the API key, next to the budget it can fill. Copying it in
+    // is a button, never automatic: the budget is a spending decision.
+    const cashRow = document.createElement("div");
+    cashRow.className = "ttp-cash-row";
+    cashTxtEl = document.createElement("span");
+    cashTxtEl.className = "ttp-cash";
+    cashBtnEl = document.createElement("button");
+    cashBtnEl.type = "button";
+    cashBtnEl.className = "ttp-btn";
+    cashBtnEl.textContent = "Use my money";
+    cashBtnEl.addEventListener("click", () => {
+      const c = lastData ? lastData.cash : null;
+      if (!c || c.state !== "ok") return;
+      state.budget = c.amount;
+      budInp.value = c.amount.toLocaleString("en-US");
+      if (budInp.__setErr) budInp.__setErr(null);
+      saveState();
       onSettingsChange();
-    }, "110px");
+      updateCash();
+    });
+    cashRow.appendChild(cashTxtEl);
+    cashRow.appendChild(cashBtnEl);
+    const budWrap = document.createElement("div");
+    budWrap.className = "ttp-stack";
+    budWrap.appendChild(budInp);
+    budWrap.appendChild(cashRow);
+
     const bufInp = numInput(
       state.bufferMin,
       0,
@@ -2332,30 +2812,27 @@
       "55px",
       { max: 24, title: "Hours you'll be asleep before returning" },
     );
-
     const startInp = document.createElement("input");
     startInp.type = "time";
     startInp.className = "ttp-input";
     startInp.title = "When you're normally awake and flying";
     startInp.value = state.activeStart;
-    startInp.style.width = "90px";
     startInp.addEventListener("change", () => {
       state.activeStart = startInp.value;
       onSettingsChange();
     });
     const nowBtn = document.createElement("button");
+    nowBtn.type = "button";
+    nowBtn.className = "ttp-btn";
     nowBtn.textContent = "Now";
     nowBtn.title = "Set Active start to the current time";
-    nowBtn.style.cssText =
-      "padding:4px 8px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:11px;";
     nowBtn.addEventListener("click", () => {
       state.activeStart = nowHHMM();
       startInp.value = state.activeStart;
-      saveState();
       onSettingsChange();
     });
     const startWrap = document.createElement("div");
-    startWrap.style.cssText = "display:flex;gap:4px;align-items:flex-end;";
+    startWrap.className = "ttp-row";
     startWrap.appendChild(startInp);
     startWrap.appendChild(nowBtn);
     const endInp = document.createElement("input");
@@ -2363,7 +2840,6 @@
     endInp.className = "ttp-input";
     endInp.title = "When you normally go to sleep";
     endInp.value = state.activeEnd;
-    endInp.style.width = "90px";
     endInp.addEventListener("change", () => {
       state.activeEnd = endInp.value;
       onSettingsChange();
@@ -2372,12 +2848,19 @@
     const respectCb = document.createElement("input");
     respectCb.type = "checkbox";
     respectCb.className = "ttp-cb";
-    respectCb.title = "Only buy items that will actually be in stock when you land";
+    respectCb.id = "ttp-respect";
+    respectCb.title = "Only buy items that will still be on the shelf when you land";
     respectCb.checked = state.respectStock;
     respectCb.addEventListener("change", () => {
       state.respectStock = respectCb.checked;
       onSettingsChange();
     });
+    const respectWrap = document.createElement("label");
+    respectWrap.className = "ttp-check";
+    respectWrap.setAttribute("for", "ttp-respect");
+    respectWrap.appendChild(respectCb);
+    respectWrap.appendChild(document.createTextNode("only what is there on landing"));
+
     const swInp = numInput(
       state.stockWindow,
       -30,
@@ -2387,7 +2870,7 @@
         onSettingsChange();
       },
       "50px",
-      { max: 2880, integer: true, title: "Land ~N min after a restock (negative = as soon as possible)" },
+      { max: 2880, integer: true, title: "Land this many minutes after a restock (negative = as soon as possible)" },
     );
     const nwInp = numInput(
       state.nerveWasteLimit,
@@ -2400,38 +2883,45 @@
       "50px",
       { max: 1000, integer: true, title: "Warn when the round trip wastes more than this much nerve" },
     );
-    // Nerve waste only matters when the user says so — the checkbox gates it.
     const nerveCb = document.createElement("input");
     nerveCb.type = "checkbox";
     nerveCb.className = "ttp-cb";
+    nerveCb.id = "ttp-nerve";
     nerveCb.checked = !!state.nerveCare;
-    nerveCb.title = "Care about nerve capping while you're in the air";
+    nerveCb.title = "Care about nerve capping while you are in the air";
     const nwRow = document.createElement("div");
-    nwRow.style.cssText = "display:flex;gap:5px;align-items:center;";
-    nwRow.appendChild(nerveCb);
+    nwRow.className = "ttp-row";
+    // Same labelled target as the other checkboxes: a bare 15px box is not a tap
+    // target and gives screen readers nothing.
+    const nerveLbl = document.createElement("label");
+    nerveLbl.className = "ttp-check";
+    nerveLbl.setAttribute("for", "ttp-nerve");
+    nerveLbl.appendChild(nerveCb);
+    nerveLbl.appendChild(document.createTextNode("care about nerve"));
+    nwRow.appendChild(nerveLbl);
     nwRow.appendChild(nwInp);
     nerveCb.addEventListener("change", () => {
       state.nerveCare = nerveCb.checked;
       nwInp.disabled = !nerveCb.checked;
-      nwInp.style.opacity = nerveCb.checked ? "1" : "0.45";
       onSettingsChange();
     });
-    if (!state.nerveCare) {
-      nwInp.disabled = true;
-      nwInp.style.opacity = "0.45";
-    }
+    if (!state.nerveCare) nwInp.disabled = true;
+
     const keyInp = document.createElement("input");
     keyInp.type = "password";
-    keyInp.placeholder = "API key (items + nerve)";
-    keyInp.value = state.apiKey || "";
     keyInp.className = "ttp-input";
-    keyInp.style.width = "120px";
+    keyInp.placeholder = "Paste your key";
+    keyInp.title =
+      "Torn API key: reads market values, your nerve bar and your cash on hand (money needs Limited access)";
+    keyInp.value = state.apiKey || "";
     keyInp.addEventListener("change", () => {
       state.apiKey = keyInp.value.trim();
       saveState();
-      loadData(true); // refetch so items/nerve use the new key
+      loadData(true); // refetch so items, nerve and cash use the new key
     });
+
     const confSel = document.createElement("select");
+    confSel.className = "ttp-sel";
     ["med", "high", "low"].forEach((v) => {
       const o = document.createElement("option");
       o.value = v;
@@ -2439,7 +2929,6 @@
       confSel.appendChild(o);
     });
     confSel.value = state.restockConfidence || "med";
-    confSel.className = "ttp-sel";
     confSel.addEventListener("change", () => {
       state.restockConfidence = confSel.value;
       onSettingsChange();
@@ -2448,100 +2937,96 @@
     const autoCb = document.createElement("input");
     autoCb.type = "checkbox";
     autoCb.className = "ttp-cb";
+    autoCb.id = "ttp-auto";
     autoCb.title = "Re-fetch live prices and restock data every 10 minutes";
     autoCb.checked = state.autoRefresh;
     autoCb.addEventListener("change", () => {
       state.autoRefresh = autoCb.checked;
       saveState();
     });
+    const autoWrap = document.createElement("label");
+    autoWrap.className = "ttp-check";
+    autoWrap.setAttribute("for", "ttp-auto");
+    autoWrap.appendChild(autoCb);
+    autoWrap.appendChild(document.createTextNode("auto refresh"));
+
     const refreshBtn = document.createElement("button");
+    refreshBtn.type = "button";
     refreshBtn.id = "ttp-refresh";
+    refreshBtn.className = "ttp-btn ttp-btn-primary";
     refreshBtn.textContent = "Refresh";
-    refreshBtn.style.cssText =
-      "padding:5px 14px;background:#238636;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;";
     refreshBtn.addEventListener("click", () => loadData(true));
 
     ctl.appendChild(field("Travel method", modeSel));
     ctl.appendChild(field("Item capacity", capInp));
     ctl.appendChild(field("Net % (trade)", netInp));
-    ctl.appendChild(field("Budget (capital)", budInp));
-    ctl.appendChild(field("Buy buffer (min)", bufInp));
+    ctl.appendChild(field("Budget (capital)", budWrap, "grid-column: span 2;"));
     ctl.appendChild(field("Active start", startWrap));
     ctl.appendChild(field("Active end", endInp));
     ctl.appendChild(field("Sleep (h)", sleepInp));
-    ctl.appendChild(field("Stock on arrival", respectCb, "justify-content:flex-end;"));
+    ctl.appendChild(field("Buy buffer (min)", bufInp));
     ctl.appendChild(field("Stock window (min)", swInp));
     ctl.appendChild(field("Restock confidence", confSel));
+    ctl.appendChild(field("Stock at landing", respectWrap));
     ctl.appendChild(field("Nerve waste", nwRow));
-    ctl.appendChild(field("API key", keyInp, "flex-basis:160px;"));
-    ctl.appendChild(field("Auto-refresh", autoCb, "justify-content:flex-end;"));
-    ctl.appendChild(refreshBtn);
+    ctl.appendChild(field("API key", keyInp));
+    ctl.appendChild(field("Auto-refresh", autoWrap));
+    ctl.appendChild(
+      field(
+        "\u00a0",
+        (() => {
+          const w = document.createElement("div");
+          w.className = "ttp-row";
+          w.appendChild(refreshBtn);
+          return w;
+        })(),
+      ),
+    );
+    plannerWrap.appendChild(ctl);
 
-
-    body.appendChild(ctl);
-
-    // Status, summary, table
     const status = document.createElement("div");
     status.id = "ttp-status";
+    status.className = "ttp-status";
+    status.textContent = "starting up";
     statusEl = status;
-    status.style.cssText =
-      "color:#bbb;font-size:12px;background:rgba(255,255,255,0.03);padding:6px 10px;border-radius:4px;";
-    status.textContent = "Loading…";
-    body.appendChild(status);
+    plannerWrap.appendChild(status);
 
     const summary = document.createElement("div");
     summary.id = "ttp-summary";
     summaryEl = summary;
-    body.appendChild(summary);
+    plannerWrap.appendChild(summary);
 
-    const tw = document.createElement("div");
-    tw.id = "ttp-table";
-    tableWrap = tw;
-    tw.style.cssText = "overflow-x:auto;";
-    tw.innerHTML = '<div style="color:#aaa;">Click <b>Refresh</b> to fetch live prices.</div>';
-    body.appendChild(tw);
+    const cardsHead = document.createElement("div");
+    cardsHead.id = "ttp-cards-head";
+    cardsHead.className = "ttp-cards-head";
+    cardsHeadEl = cardsHead;
+    plannerWrap.appendChild(cardsHead);
 
-    // ---- Tabs: keep the planner uncluttered; item tracking gets its own view ----
-    const tabBar = document.createElement("div");
-    tabBar.style.cssText = "display:flex;gap:6px;padding:8px 14px 0;";
-    function tabBtn(label, key) {
-      const b = document.createElement("button");
-      b.textContent = label;
-      b.style.cssText =
-        "padding:5px 14px;border:1px solid #30363d;border-bottom:none;border-radius:6px 6px 0 0;background:#161b22;color:#9aa4b2;font-size:12px;font-weight:bold;cursor:pointer;";
-      b.addEventListener("click", () => setTab(key));
-      return b;
-    }
-    tabBtnPlanner = tabBtn("Planner", "planner");
-    tabBtnTracker = tabBtn("Item tracker", "tracker");
-    tabBar.appendChild(tabBtnPlanner);
-    tabBar.appendChild(tabBtnTracker);
-    applyTabStyles();
+    const cards = document.createElement("div");
+    cards.id = "ttp-cards";
+    cards.className = "ttp-cards";
+    cardsEl = cards;
+    plannerWrap.appendChild(cards);
 
-    // Wrap everything that belongs to the planner view so tabs toggle one node.
-    plannerWrap = document.createElement("div");
-    while (body.firstChild) plannerWrap.appendChild(body.firstChild);
-    body.appendChild(tabBar);
     body.appendChild(plannerWrap);
 
-    // Tracker view: item search + tracked list + leave-times.
+    // ---- item tracker view ----
     trackerWrap = document.createElement("div");
+    trackerWrap.className = "ttp-view";
     trackerWrap.style.display = "none";
-    trackerWrap.style.cssText = "padding:10px 14px;";
     const trackRow = document.createElement("div");
-    trackRow.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+    trackRow.className = "ttp-track-search";
     trackSearchInp = document.createElement("input");
     trackSearchInp.className = "ttp-input";
-    trackSearchInp.placeholder = "Search item to track…";
-    trackSearchInp.style.cssText = "flex:1;min-width:180px;";
+    trackSearchInp.placeholder = "Search an item to track";
     trackSearchInp.setAttribute("list", "ttp-items-dl");
     trackDatalistEl = document.createElement("datalist");
     trackDatalistEl.id = "ttp-items-dl";
     const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "ttp-btn ttp-btn-primary";
     addBtn.textContent = "Track";
     addBtn.title = "Add this item to the tracker";
-    addBtn.style.cssText =
-      "padding:5px 12px;background:#238636;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;";
     addBtn.addEventListener("click", () => addTrackedItem(trackSearchInp.value));
     trackSearchInp.addEventListener("keydown", (e) => {
       if (e.key === "Enter") addTrackedItem(trackSearchInp.value);
@@ -2552,35 +3037,26 @@
     trackerWrap.appendChild(trackRow);
     const trackChips = document.createElement("div");
     trackChips.id = "ttp-track-chips";
-    trackChips.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;";
+    trackChips.className = "ttp-track-chips";
     trackerWrap.appendChild(trackChips);
     trackResultsEl = document.createElement("div");
-    trackResultsEl.style.cssText = "margin-top:10px;";
+    trackResultsEl.className = "ttp-track-results";
     trackerWrap.appendChild(trackResultsEl);
     body.appendChild(trackerWrap);
-
-    setTab(state.tab === "tracker" ? "tracker" : "planner");
 
     container.appendChild(body);
     document.body.appendChild(container);
 
-    // ---- Minified left-side button (Torn PDA / mobile friendly) ----
+    // ---- minimized left-side button (PDA friendly) ----
     const miniBtn = document.createElement("button");
-    miniBtn.style.cssText =
-      "display:none;position:fixed;left:8px;top:" +
-      (state.miniTop || 130) +
-      "px;" +
-      "z-index:100000;width:46px;height:46px;border-radius:50%;" +
-      "background:#161b22;border:2px solid #4fc3f7;color:#58a6ff;font-size:20px;cursor:pointer;" +
-      "box-shadow:0 3px 10px rgba(0,0,0,0.6);align-items:center;justify-content:center;" +
-      "touch-action:none;user-select:none;";
-    // Plane icon (inline SVG — not an emoji, renders identically everywhere)
+    miniBtn.type = "button";
+    miniBtn.className = "ttp-mini";
+    miniBtn.style.top = (state.miniTop || 130) + "px";
+    miniBtn.title = "Travel planner, tap to open (drag to move)";
     miniBtn.innerHTML =
       '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">' +
       '<path fill="currentColor" d="M21.5 15.5 13.5 11V5.5A1.5 1.5 0 0 0 12 4a1.5 1.5 0 0 0-1.5 1.5V11l-8 4.5V17l8-2.5v5L8.5 21v1l3.5-1 3.5 1v-1l-2-1.5v-5l8 2.5v-1.5Z"/>' +
       "</svg>";
-    miniBtn.title = "Torn Travel Planner — tap to open (drag to move)";
-    // tap to expand (unless it was a drag)
     let miniDragged = false;
     miniBtn.addEventListener("click", () => {
       if (miniDragged) {
@@ -2589,23 +3065,15 @@
       }
       setMinimized(false);
     });
-    // drag to reposition (pointer events work for mouse + touch)
     miniBtn.addEventListener("pointerdown", (e) => {
       miniDragged = false;
       const startY = e.clientY,
         startX = e.clientX;
       const startTop = miniBtn.getBoundingClientRect().top;
       const move = (ev) => {
-        const ny = startTop + (ev.clientY - startY);
-        const nx = 8 + (ev.clientX - startX);
-        const maxY = Math.max(
-          8,
-          (window.innerHeight || document.documentElement.clientHeight) - 54,
-        );
-        const clampedY = Math.max(8, Math.min(maxY, ny));
-        miniBtn.style.top = clampedY + "px";
-        // keep it hugging the left edge (allow small horizontal too, but clamp to left side)
-        miniBtn.style.left = Math.max(8, Math.min(24, nx)) + "px";
+        const maxY = Math.max(8, (window.innerHeight || document.documentElement.clientHeight) - 54);
+        miniBtn.style.top = Math.max(8, Math.min(maxY, startTop + (ev.clientY - startY))) + "px";
+        miniBtn.style.left = Math.max(8, Math.min(24, 8 + (ev.clientX - startX))) + "px";
         if (Math.abs(ev.clientY - startY) + Math.abs(ev.clientX - startX) > 6) miniDragged = true;
       };
       const up = () => {
@@ -2622,47 +3090,205 @@
     miniButtonEl = miniBtn;
 
     const st = document.createElement("style");
-    st.textContent =
-      "#ttp-root{--ttp-bg:#0d1117;--ttp-panel:#161b22;--ttp-border:#30363d;--ttp-muted:#8b949e;--ttp-accent:#58a6ff;} " +
-      "#ttp-root .ttp-table tbody tr.ttp-row:hover{background:rgba(88,166,255,0.07);} " +
-      "#ttp-root .ttp-table tbody tr.ttp-row{cursor:pointer;} " +
-      "#ttp-root .ttp-table tbody tr.ttp-detail:hover{background:rgba(88,166,255,0.04) !important;} " +
-      "#ttp-root .ttp-table thead th{position:sticky;top:0;background:#161b22;z-index:2;} " +
-      "#ttp-root table th:hover{color:#fff;} " +
-      "#ttp-root .ttp-badge{display:inline-block;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:700;letter-spacing:0.3px;white-space:nowrap;vertical-align:middle;} " +
-      "#ttp-root .ttp-badge.ok{color:#3fb950;background:rgba(63,185,80,0.15);border:1px solid rgba(63,185,80,0.45);} " +
-      "#ttp-root .ttp-badge.wait{color:#d29922;background:rgba(210,153,34,0.13);border:1px solid rgba(210,153,34,0.45);} " +
-      "#ttp-root .ttp-badge.bad{color:#f85149;background:rgba(248,81,73,0.13);border:1px solid rgba(248,81,73,0.45);} " +
-      "#ttp-root .ttp-badge.mut{color:#8b949e;background:rgba(139,148,158,0.12);border:1px solid rgba(139,148,158,0.4);} " +
-      "#ttp-root .ttp-conf{color:#8b949e;font-size:10px;} " +
-      "@media (max-width:700px){#ttp-root{top:12px;left:50%;width:calc(100vw - 16px)!important;" +
-      "max-height:calc(100vh - 24px)!important;max-height:calc(100dvh - 24px)!important;} #ttp-root #ttp-body{padding:8px;}" +
-      "#ttp-root #ttp-controls{gap:6px;} #ttp-root #ttp-summary{font-size:12px;}" +
-      "#ttp-root .ttp-table{font-size:11px;} #ttp-root .ttp-table th,#ttp-root .ttp-table td{padding:4px 4px;}" +
-      "#ttp-root .ttp-badge{font-size:9px;padding:1px 5px;letter-spacing:0;} " +
-      "#ttp-root .ttp-detail td{padding:4px 8px !important;}}" +
-      "@media (max-width:520px){" +
-      "#ttp-root th[data-key=\"windowProfit\"],#ttp-root td:nth-child(5)," +
-      "#ttp-root th[data-key=\"budgetSpent\"],#ttp-root td:nth-child(6){display:none;}" +
-      "#ttp-root .ttp-table{display:block;overflow-x:auto;white-space:nowrap;}}" +
-      "#ttp-root .ttp-label{color:#9aa4b2;font-size:10px;text-transform:uppercase;letter-spacing:.4px;font-weight:600;} " +
-      "#ttp-root .ttp-err{color:#f85149;font-size:10px;line-height:1.25;} " +
-      "#ttp-root .ttp-input,#ttp-root .ttp-sel{background:#0b0f14;border:1px solid #30363d;color:#e6edf3;border-radius:5px;padding:4px 8px;font-size:12px;transition:border-color .15s,box-shadow .15s;} " +
-      "#ttp-root .ttp-input:hover,#ttp-root .ttp-sel:hover{border-color:#4d5763;} " +
-      "#ttp-root .ttp-input:focus,#ttp-root .ttp-sel:focus{border-color:#58a6ff;outline:none;box-shadow:0 0 0 2px rgba(88,166,255,.25);} " +
-      "#ttp-root .ttp-input.ttp-bad,#ttp-root .ttp-sel.ttp-bad{border-color:#f85149;background:rgba(248,81,73,.07);} " +
-      "#ttp-root .ttp-input:disabled{opacity:.45;} " +
-      "#ttp-root .ttp-cb{width:14px;height:14px;accent-color:#238636;cursor:pointer;} " +
-      "#ttp-help{position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;font-family:Arial,sans-serif;}" +
-      "#ttp-help .ttp-help-card{background:#161b22;border:1px solid #30363d;border-radius:10px;max-width:640px;width:92vw;max-height:80vh;overflow-y:auto;padding:16px 20px;box-shadow:0 8px 30px rgba(0,0,0,.8);color:#e6edf3;font-size:12px;}" +
-      "#ttp-help h3{margin:0 0 12px;color:#58a6ff;font-size:14px;}" +
-      "#ttp-help .h-row{margin-bottom:8px;line-height:1.45;}" +
-      "#ttp-help .h-k{color:#e6edf3;font-weight:700;}" +
-      "#ttp-help .h-d{color:#9aa4b2;}" +
-      "#ttp-help .h-sec{margin:14px 0 6px;padding-top:8px;border-top:1px solid #30363d;color:#58a6ff;font-weight:700;font-size:12px;}";
+    st.id = "ttp-css";
+    st.textContent = TTP_CSS;
     document.head.appendChild(st);
+
+    updateChips(); // fill the chip strip from the loaded state
+    setTab(state.tab === "tracker" ? "tracker" : "planner");
+    updateCash(); // the readout starts in its "reading" state
   }
 
+  // Every colour and size in one place. Two rules drive it: money is the only thing
+  // that gets colour (green up, red down), and the recommended route is the only
+  // tinted surface. Amber is a restock status marker, never decoration.
+  const TTP_CSS = `
+#ttp-root, #ttp-help {
+  --bg:#0d1117; --panel:#161b22; --raise:#1c232c; --line:#2b333d; --line-soft:#212934;
+  --ink:#e8edf4; --ink-2:#9aa4b2; --ink-3:#8a94a3;
+  --accent:#3fb950; --neg:#f2545b; --amber:#d7a33c;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+}
+#ttp-root{position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:99999;
+  width:min(820px,96vw);max-height:calc(100vh - 40px);display:flex;flex-direction:column;
+  background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:12px;
+  box-shadow:0 12px 34px rgba(0,0,0,.6);overflow:hidden;font-family:var(--sans);font-size:13px;line-height:1.45;}
+#ttp-header{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line);cursor:grab;user-select:none;}
+#ttp-root .ttp-title{display:inline-flex;align-items:center;gap:8px;font-weight:650;font-size:14px;}
+#ttp-root .ttp-title svg{color:var(--accent)}
+#ttp-root .ttp-head-btns{display:flex;gap:6px}
+#ttp-root .ttp-icon-btn{background:none;border:1px solid var(--line);border-radius:6px;min-width:26px;height:26px;
+  color:var(--ink-2);cursor:pointer;font-size:13px;line-height:1;padding:0 6px;}
+#ttp-root .ttp-icon-btn:hover{color:var(--ink);border-color:var(--ink-3)}
+#ttp-body{overflow-y:auto;overflow-x:hidden}
+#ttp-root .ttp-tabs{display:flex;gap:18px;padding:12px 14px 0}
+#ttp-root .ttp-tab{background:none;border:0;color:var(--ink-3);font:inherit;font-size:13px;padding:0 0 6px;cursor:pointer}
+#ttp-root .ttp-tab:hover{color:var(--ink-2)}
+#ttp-root .ttp-tab[aria-current="true"]{color:var(--ink);box-shadow:inset 0 -2px 0 var(--accent)}
+#ttp-root .ttp-view{padding:12px 14px 16px}
+
+/* settings: a chip strip that opens into the form */
+#ttp-root .ttp-chips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:10px}
+#ttp-root .ttp-chip-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+#ttp-root .ttp-chip{font-family:var(--mono);font-size:11px;color:var(--ink-2);border:1px solid var(--line);
+  border-radius:4px;padding:2px 7px;white-space:nowrap}
+#ttp-root .ttp-settings-btn{margin-left:auto}
+#ttp-root .ttp-settings{display:none;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:10px 12px;
+  padding:12px;margin-bottom:10px;background:var(--raise);border:1px solid var(--line);border-radius:10px}
+#ttp-root .ttp-settings.open{display:grid}
+#ttp-root .ttp-label{color:var(--ink-3);font-size:11px;margin-bottom:4px}
+#ttp-root .ttp-err{color:var(--neg);font-size:10px;line-height:1.25}
+#ttp-root .ttp-stack,#ttp-root .ttp-row{display:flex;flex-direction:column;gap:4px}
+#ttp-root .ttp-row{flex-direction:row;align-items:center;gap:6px}
+#ttp-root .ttp-cash-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+#ttp-root .ttp-cash{color:var(--ink-3);font-size:10px}
+#ttp-root .ttp-check{display:flex;align-items:center;gap:6px;color:var(--ink-2);font-size:12px;cursor:pointer}
+#ttp-root .ttp-input,#ttp-root .ttp-sel{background:#0b0f14;border:1px solid var(--line);color:var(--ink);
+  border-radius:6px;padding:5px 8px;font-size:13px;font-family:inherit;width:100%;box-sizing:border-box}
+#ttp-root .ttp-input:hover,#ttp-root .ttp-sel:hover{border-color:#3c4654}
+#ttp-root .ttp-input:focus-visible,#ttp-root .ttp-sel:focus-visible,#ttp-root .ttp-btn:focus-visible,
+#ttp-root .ttp-tab:focus-visible,#ttp-root .ttp-route:focus-visible,#ttp-root .ttp-icon-btn:focus-visible{
+  outline:2px solid var(--accent);outline-offset:1px}
+#ttp-root .ttp-input.ttp-bad{border-color:var(--neg);background:rgba(242,84,91,.08)}
+#ttp-root .ttp-input:disabled{opacity:.5}
+#ttp-root .ttp-cb{width:15px;height:15px;accent-color:var(--accent);cursor:pointer}
+#ttp-root .ttp-btn{background:var(--raise);border:1px solid var(--line);color:var(--ink);border-radius:6px;
+  font:inherit;font-size:12px;padding:5px 11px;cursor:pointer}
+#ttp-root .ttp-btn:hover{border-color:var(--accent)}
+#ttp-root .ttp-btn:disabled{opacity:.5;cursor:default}
+#ttp-root .ttp-btn-primary{background:var(--accent);border-color:var(--accent);color:#08130c;font-weight:650}
+
+/* status strip */
+#ttp-root .ttp-status{color:var(--ink-3);font-size:11px;font-family:var(--mono);padding:2px 0 10px}
+#ttp-root .ttp-loading{color:var(--amber)}
+
+/* hero */
+#ttp-root .ttp-hero{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:16px 18px 14px;overflow:hidden}
+#ttp-root .ttp-hero::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}
+#ttp-root .ttp-kicker{display:block;color:var(--accent);font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase}
+#ttp-root .ttp-hero-top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:6px 0 0}
+#ttp-root .ttp-hero h2,#ttp-root .ttp-card h2{font-size:22px;font-weight:650;letter-spacing:-.2px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+#ttp-root .ttp-hero h2 small,#ttp-root .ttp-card h2 small{font-size:12px;font-weight:400;color:var(--ink-3);letter-spacing:0}
+#ttp-root .ttp-answer{display:flex;flex-wrap:wrap;gap:22px;margin:14px 0 0}
+#ttp-root .ttp-answer-sm{gap:18px;margin-top:10px}
+#ttp-root .ttp-stat{display:flex;flex-direction:column;gap:1px;min-width:78px}
+#ttp-root .ttp-stat .lbl{color:var(--ink-3);font-size:11px}
+#ttp-root .ttp-stat .val{font-size:24px;font-weight:650;line-height:1.15}
+#ttp-root .ttp-stat .val.sm{font-size:17px;font-weight:600}
+#ttp-root .ttp-stat .val.clock{font-family:var(--mono);font-size:26px;letter-spacing:-.5px}
+#ttp-root .ttp-stat .val.clock.go{color:var(--accent)}
+#ttp-root .ttp-stat .val.pos{color:var(--accent)}
+#ttp-root .ttp-stat .rel{color:var(--ink-2);font-size:12px}
+#ttp-root .ttp-hero-buy{margin-top:14px;padding-top:12px;border-top:1px solid var(--line-soft)}
+#ttp-root .ttp-hero-foot{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:10px;color:var(--ink-3);font-size:11px}
+#ttp-root .ttp-hero-foot b{color:var(--ink-2);font-weight:600}
+#ttp-root .ttp-warn{margin-top:12px;padding:8px 10px;border:1px solid rgba(215,163,60,.45);border-radius:8px;
+  background:rgba(215,163,60,.10);color:var(--amber);font-size:12px}
+#ttp-root .ttp-hero-empty::before,#ttp-root .ttp-hero-error::before{background:var(--ink-3)}
+#ttp-root .ttp-hero-error .ttp-kicker{color:var(--neg)}
+#ttp-root .ttp-muted{color:var(--ink-2);font-size:12px;margin-top:6px}
+#ttp-root .ttp-bars{display:inline-block;width:14px;height:14px;margin-right:8px;border-radius:50%;
+  border:2px solid var(--line);border-top-color:var(--accent);animation:ttp-spin 1s linear infinite;vertical-align:-2px}
+@keyframes ttp-spin{to{transform:rotate(360deg)}}
+
+/* buy list */
+#ttp-root .ttp-buy{list-style:none;margin:6px 0 0;padding:0}
+#ttp-root .ttp-buy li{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--line-soft)}
+#ttp-root .ttp-buy li:last-child{border-bottom:0}
+#ttp-root .ttp-buy .nm{font-weight:600}
+#ttp-root .ttp-buy .qty{font-family:var(--mono);color:var(--ink-2)}
+#ttp-root .ttp-buy .cash{font-family:var(--mono);color:var(--ink-2)}
+#ttp-root .ttp-buy .cash.pos{color:var(--accent)}
+#ttp-root .ttp-buy .tag{margin-left:auto}
+#ttp-root .ttp-badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:10px;white-space:nowrap;
+  vertical-align:middle;border:1px solid transparent}
+#ttp-root .ttp-badge.ok{color:var(--accent);background:rgba(63,185,80,.14);border-color:rgba(63,185,80,.42)}
+#ttp-root .ttp-badge.wait{color:var(--amber);background:rgba(215,163,60,.13);border-color:rgba(215,163,60,.42)}
+#ttp-root .ttp-badge.bad{color:var(--neg);background:rgba(242,84,91,.13);border-color:rgba(242,84,91,.42)}
+#ttp-root .ttp-badge.mut{color:var(--ink-3);background:rgba(138,148,163,.12);border-color:rgba(138,148,163,.38)}
+#ttp-root .ttp-conf{color:var(--ink-3);font-size:10px}
+
+/* route cards */
+#ttp-root .ttp-cards-head{display:flex;align-items:baseline;gap:12px;margin:16px 0 8px;
+  color:var(--ink-3);font-size:11px}
+#ttp-root .ttp-sort{margin-left:auto;display:inline-flex;align-items:center;gap:6px}
+#ttp-root .ttp-sort select{background:#0b0f14;border:1px solid var(--line);color:var(--ink);
+  border-radius:6px;padding:3px 6px;font:inherit;font-size:11px}
+#ttp-root .ttp-cards{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+#ttp-root .ttp-route{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 13px;cursor:pointer}
+#ttp-root .ttp-route:hover{border-color:#3c4654;background:var(--raise)}
+#ttp-root .ttp-route-top{display:flex;align-items:baseline;gap:10px}
+#ttp-root .ttp-route h3{font-size:13px;font-weight:600;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+#ttp-root .ttp-route h3 small{color:var(--ink-3);font-weight:400;font-size:11px}
+#ttp-root .ttp-route .pph{margin-left:auto;font-family:var(--mono);color:var(--accent);font-weight:600;white-space:nowrap}
+#ttp-root .ttp-route-line{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:5px;color:var(--ink-2);font-size:12px}
+#ttp-root .ttp-route-line .leave{font-family:var(--mono);color:var(--ink)}
+#ttp-root .ttp-route-line .leave.go{color:var(--accent)}
+#ttp-root .ttp-route-line .dim{color:var(--ink-3)}
+#ttp-root .ttp-route-more{display:none;margin-top:9px;padding-top:9px;border-top:1px solid var(--line-soft)}
+#ttp-root .ttp-route.open .ttp-route-more{display:block}
+#ttp-root .ttp-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-top:10px}
+#ttp-root .ttp-sleep .ttp-kicker{color:var(--ink-2)}
+
+/* item tracker */
+#ttp-root .ttp-track-search{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+#ttp-root .ttp-track-search .ttp-input{flex:1;min-width:180px}
+#ttp-root .ttp-track-chips{display:flex;flex-wrap:wrap;gap:6px}
+#ttp-root .ttp-chip .ttp-chip-x{background:none;border:0;color:var(--neg);cursor:pointer;font-size:13px;line-height:1;padding:0 0 0 4px}
+#ttp-root .ttp-track-results{margin-top:12px}
+#ttp-root .ttp-track-group{margin-bottom:12px}
+#ttp-root .ttp-track-group h3{font-size:13px;font-weight:650;color:var(--ink);margin-bottom:4px}
+#ttp-root .ttp-track-row{font-size:12px;color:var(--ink-2);padding:3px 0}
+#ttp-root .ttp-track-row .leave{font-family:var(--mono);color:var(--ink)}
+#ttp-root .ttp-track-row .leave.go{color:var(--accent)}
+#ttp-root .ttp-track-row .dim{color:var(--ink-3)}
+
+/* minimized button: appended to document.body, OUTSIDE #ttp-root (it has to survive
+   #ttp-root being hidden), so it cannot rely on the token block or a #ttp-root prefix */
+.ttp-mini{display:none;position:fixed;left:8px;z-index:100000;width:46px;height:46px;border-radius:50%;
+  background:#161b22;border:2px solid #3fb950;color:#3fb950;cursor:pointer;
+  box-shadow:0 4px 14px rgba(0,0,0,.55);align-items:center;justify-content:center;touch-action:none;user-select:none}
+.ttp-mini:focus-visible{outline:2px solid #3fb950;outline-offset:2px}
+
+/* help overlay */
+#ttp-help{position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.65);display:flex;align-items:center;
+  justify-content:center;font-family:var(--sans)}
+#ttp-help .ttp-help-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  max-width:640px;width:92vw;max-height:80vh;overflow-y:auto;padding:16px 20px;color:var(--ink);font-size:12px}
+#ttp-help h3{margin:0 0 12px;color:var(--accent);font-size:14px}
+#ttp-help .h-row{margin-bottom:8px;line-height:1.45}
+#ttp-help .h-k{color:var(--ink);font-weight:650}
+#ttp-help .h-d{color:var(--ink-2)}
+#ttp-help .h-sec{margin:14px 0 6px;padding-top:8px;border-top:1px solid var(--line);color:var(--accent);font-weight:650}
+#ttp-help .ttp-btn{background:var(--raise);border:1px solid var(--line);color:var(--ink);border-radius:6px;
+  font:inherit;font-size:12px;padding:6px 12px;cursor:pointer;margin-top:10px}
+#ttp-help .ttp-btn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+
+/* phone and touch: the panel is used on Torn PDA, so controls clear 44px and the
+   cards stop being a two column grid long before the desktop layout would break. */
+@media (max-width:700px){
+  #ttp-root{top:12px;width:calc(100vw - 16px);max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px)}
+  #ttp-root .ttp-view{padding:10px 10px 14px}
+  #ttp-root .ttp-cards{grid-template-columns:1fr}
+  #ttp-root .ttp-settings{grid-template-columns:1fr 1fr}
+  #ttp-root .ttp-answer{gap:16px}
+  #ttp-root .ttp-stat .val.clock{font-size:22px}
+}
+@media (max-width:430px){
+  #ttp-root .ttp-settings{grid-template-columns:1fr}
+  #ttp-root .ttp-hero h2{font-size:19px}
+}
+@media (max-width:700px), (pointer:coarse){
+  #ttp-root .ttp-btn,#ttp-root .ttp-tab,#ttp-root .ttp-icon-btn{min-height:44px;min-width:44px}
+  #ttp-root .ttp-input,#ttp-root .ttp-sel{min-height:44px}
+  #ttp-root .ttp-sort select{min-height:44px}
+  #ttp-root .ttp-chip{padding:6px 9px}
+  #ttp-root .ttp-check{min-height:44px}
+}
+`;
   function btnStyle() {
     return "background:none;border:none;color:#aaa;font-size:15px;cursor:pointer;padding:0 6px;line-height:1;";
   }
@@ -2698,9 +3324,10 @@
     }, 60000);
   }
   function scheduleStatusTicker() {
-    // Live "Data Xs old" counter — ticks the age every second so it's never frozen.
+    // One second tick that rewrites two text nodes (feed age, hero countdown) and
+    // never re-renders the panel.
     if (statusTimer) clearInterval(statusTimer);
-    statusTimer = setInterval(updateStatus, 1000);
+    statusTimer = setInterval(tick, 1000);
   }
   function init() {
     loadState();
@@ -2713,6 +3340,11 @@
     loadData();
     scheduleAutoRefresh();
     scheduleStatusTicker();
+    // Flush any pending restock records before the tab goes away.
+    window.addEventListener("pagehide", flushHistory);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) flushHistory();
+    });
     log("Travel Planner ready.");
   }
 
@@ -2757,6 +3389,33 @@
       restockSource,
       departurePlan,
       localHHMM,
+      parseMoney,
+      groupDigits,
+      formatMoneyTyping,
+      normalizeBars,
+      moneyOnHand,
+      buildHero,
+      buildCards,
+      renderResults,
+      fmtCountdown,
+      statusChip,
+      updateChips,
+      updateCash,
+      esc,
+      tick,
+      flushHistory,
+      // Test-only plumbing: lets the harness capture hero HTML and drive the panel
+      // (cash button, loading state) headlessly.
+      __setSummaryEl(el) {
+        summaryEl = el;
+      },
+      __setLastData(v) {
+        lastData = v;
+      },
+      __setView(kind, message) {
+        viewState = kind || "idle";
+        viewMessage = message || "";
+      },
       setBackend(v) {
         _backend = v;
       },

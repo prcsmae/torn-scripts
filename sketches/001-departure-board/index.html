@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Torn Travel Planner · Variant A · Departure board</title>
+<style>
+  /* Design read: data-dense decision panel for a Torn player who flies many times
+     a day, sitting inside torn.com's dark UI. Utilitarian tool language.
+     Dial: ENERGY 1 / RHYTHM 1 / MOTION 1.
+     Colour: neutrals + ONE accent (green = the recommended row and profit);
+     red appears only for negative money, because that is data, not decoration. */
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel-2:#1c232c; --line:#2b333d; --line-soft:#212934;
+    --ink:#e8edf4; --ink-2:#9aa4b2; --ink-3:#8a94a3;
+    --accent:#3fb950; --accent-soft:rgba(63,185,80,.10); --neg:#f2545b;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+    --r:5px; --tight:6px; --gap:14px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0a0d12;color:var(--ink);font-family:var(--sans);font-size:13px;line-height:1.45;padding:22px 16px 40px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1040px;margin:0 auto}
+  .caption{color:var(--ink-3);font-size:11px;margin:0 0 10px 2px;text-transform:none}
+  .caption b{color:var(--ink-2);font-weight:600}
+
+  .panel{background:var(--bg);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+
+  /* header */
+  .bar{display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+  .bar h1{font-size:13px;font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:7px}
+  .bar h1 svg{opacity:.8}
+  .seg{display:flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-left:auto}
+  .seg button{background:none;border:0;color:var(--ink-2);font:inherit;font-size:12px;padding:4px 11px;cursor:pointer}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button[aria-selected="true"]{background:var(--panel-2);color:var(--ink);font-weight:600}
+  .icon-btn{background:none;border:1px solid var(--line);border-radius:50%;width:22px;height:22px;color:var(--ink-2);cursor:pointer;font-size:12px;line-height:1}
+  .icon-btn:hover{color:var(--ink);border-color:var(--ink-3)}
+
+  /* settings become a chip strip: they change rarely, the answer changes constantly */
+  .chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line-soft);background:rgba(255,255,255,.012)}
+  .chip{font-family:var(--mono);font-size:11px;color:var(--ink-2);border:1px solid var(--line);border-radius:3px;padding:1px 6px;white-space:nowrap}
+  .chip b{color:var(--ink);font-weight:600}
+  .chips .adjust{margin-left:auto;background:none;border:1px solid var(--line);border-radius:var(--r);color:var(--ink-2);font:inherit;font-size:11px;padding:3px 9px;cursor:pointer}
+  .chips .adjust:hover{color:var(--ink);border-color:var(--ink-3)}
+  .settings{display:none;padding:10px 12px;border-bottom:1px solid var(--line-soft);background:var(--panel-2);
+    grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px 10px}
+  .settings.open{display:grid}
+  .fld label{display:block;color:var(--ink-3);font-size:10px;margin-bottom:3px}
+  .fld input,.fld select{width:100%;background:#0b0f14;border:1px solid var(--line);color:var(--ink);border-radius:3px;padding:3px 6px;font-family:var(--mono);font-size:12px}
+  .fld input:focus,.fld select:focus{outline:none;border-color:var(--accent)}
+  .fld .sub{display:flex;align-items:center;gap:6px;margin-top:4px}
+  .fld .sub span{font-family:var(--mono);font-size:10px;color:var(--ink-2)}
+  .tiny{background:var(--panel);border:1px solid var(--line);color:var(--ink-2);border-radius:3px;font:inherit;font-size:10px;padding:2px 6px;cursor:pointer}
+  .tiny:hover{color:var(--ink);border-color:var(--ink-3)}
+
+  /* the board */
+  table{width:100%;border-collapse:collapse}
+  thead th{text-align:right;font-size:10px;font-weight:600;color:var(--ink-3);padding:7px 8px;border-bottom:1px solid var(--line);cursor:pointer;white-space:nowrap;user-select:none}
+  thead th:first-child,thead th:nth-child(2){text-align:left}
+  thead th[aria-sort] {color:var(--ink)}
+  tbody td{padding:7px 8px;text-align:right;font-family:var(--mono);font-size:12px;border-bottom:1px solid var(--line-soft);white-space:nowrap}
+  tbody tr.dest{cursor:pointer}
+  tbody tr.dest:hover{background:rgba(255,255,255,.028)}
+  tbody tr.dest.best{background:var(--accent-soft)}
+  tbody tr.dest.best td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
+  td.who{text-align:left;font-family:var(--sans)}
+  td.who .n{font-weight:600}
+  td.who .c{color:var(--ink-3);font-size:11px}
+  .go{color:var(--accent);font-weight:600}
+  .depart{font-size:13px;font-weight:600}
+  .pos{color:var(--accent)} .neg{color:var(--neg)}
+  .dim{color:var(--ink-3)}
+  .st{font-family:var(--sans);font-size:11px;color:var(--ink-2)}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:1px}
+  .dot.go{background:var(--accent)} .dot.wait{background:#d7a33c} .dot.dead{background:var(--ink-3)}
+  tr.detail{display:none}
+  tr.detail.open{display:table-row}
+  tr.detail td{text-align:left;font-family:var(--sans);background:#0b0f14;color:var(--ink-2);font-size:12px;padding:9px 12px 11px}
+  tr.detail .line{display:flex;flex-wrap:wrap;gap:6px 16px}
+  tr.detail .line b{color:var(--ink)}
+  tr.detail .note{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:5px}
+
+  .foot{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;padding:8px 12px;color:var(--ink-3);font-size:11px;border-top:1px solid var(--line)}
+  .foot code{font-family:var(--mono);color:var(--ink-2)}
+  @media (max-width:520px){
+    body{padding:12px 8px 30px}
+    .hide-sm{display:none}
+    thead th,tbody td{padding:6px 5px;font-size:11px}
+    .who .c{display:none}
+  }
+  /* Touch: Torn is played on PDA, so controls and rows must clear the 44px tap
+     target (R-03) instead of the 22-27px desktop density. */
+  @media (max-width:640px), (pointer:coarse){
+    .seg button,.chips .adjust,.tiny,.fld input,.fld select{min-height:44px}
+    .icon-btn{width:44px;height:44px;font-size:15px}
+    tbody td{padding:13px 8px}
+    thead th{padding:11px 8px}
+  }
+  tr.dest:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  /* A dense board cannot fit in 430px: let it scroll deliberately instead of
+     letting the panel clip columns away (the panel itself stays wider than the
+     phone only inside this wrapper). */
+  .tablewrap{overflow-x:auto}
+  @media (max-width:520px){ table{min-width:520px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="caption">Variant A · <b>Departure board</b> · tool-first, one row per destination, monospace so the numbers line up in one sweep. Row data is a real planner snapshot.</p>
+  <div class="panel">
+    <div class="bar">
+      <h1>
+        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M21.5 15.5 13.5 11V5.5A1.5 1.5 0 0 0 12 4a1.5 1.5 0 0 0-1.5 1.5V11l-8 4.5V17l8-2.5v5L8.5 21v1l3.5-1 3.5 1v-1l-2-1.5v-5l8 2.5v-1.5Z"/></svg>
+        Travel planner
+      </h1>
+      <div class="seg" role="tablist">
+        <button role="tab" aria-selected="true">Routes</button>
+        <button role="tab" aria-selected="false">Item tracker</button>
+      </div>
+      <button class="icon-btn" id="help" title="How to use this">?</button>
+    </div>
+
+    <div class="chips">
+      <span class="chip">Airstrip</span>
+      <span class="chip"><b>18</b> slots</span>
+      <span class="chip">net <b>97%</b></span>
+      <span class="chip">budget <b>$50,000,000</b></span>
+      <span class="chip">stock@arrival</span>
+      <span class="chip">confidence <b>med</b></span>
+      <button class="adjust" id="adjust">Adjust settings</button>
+    </div>
+
+    <div class="settings" id="settings">
+      <div class="fld"><label for="mode">Travel method</label>
+        <select id="mode"><option>Airstrip</option><option>Standard</option><option>WLT</option><option>Business</option></select></div>
+      <div class="fld"><label for="cap">Item capacity</label><input id="cap" value="18"></div>
+      <div class="fld"><label for="net">Net % (trade)</label><input id="net" value="97"></div>
+      <div class="fld"><label for="bud">Budget (capital)</label><input id="bud" value="50,000,000">
+        <div class="sub"><span>cash on hand [from your key]</span><button class="tiny" id="usecash">Use my money</button></div></div>
+      <div class="fld"><label for="buf">Buy buffer (min)</label><input id="buf" value="5"></div>
+      <div class="fld"><label for="start">Active start</label><input id="start" value="22:56"></div>
+      <div class="fld"><label for="end">Active end</label><input id="end" placeholder="off"></div>
+      <div class="fld"><label for="sleep">Sleep (h)</label><input id="sleep" value="8"></div>
+      <div class="fld"><label for="win">Stock window (min)</label><input id="win" value="-1"></div>
+      <div class="fld"><label for="conf">Restock confidence</label>
+        <select id="conf"><option>Med</option><option>High</option><option>Low</option></select></div>
+      <div class="fld"><label for="api">API key</label><input id="api" type="password" placeholder="Paste your key"></div>
+      <div class="fld"><label>&nbsp;</label><button class="tiny" id="refresh" style="width:100%;padding:4px"><b>Refresh</b></button></div>
+    </div>
+
+    <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th aria-sort="descending">Destination</th>
+          <th>Leave</th>
+          <th>On arrival</th>
+          <th>Profit/trip</th>
+          <th>Per hour</th>
+          <th class="hide-sm">Round trip</th>
+          <th class="hide-sm">Capital</th>
+          <th class="hide-sm">ROI</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    </div>
+
+    <div class="foot">
+      <span>Feed <code>3s old</code></span>
+      <span>Airstrip · 18 slots · net 97%</span>
+      <span>Snapshot 2026-10-12 22:56 local</span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---- real snapshot: one planner run, 2026-10-12 22:56 local, airstrip, 18 slots, net 97%, $50M ----
+const ROWS = [
+  { name:"Argentina", city:"Buenos Aires", timed:true, leave:"02:20", src:"cloud · high", profit:832834, pph:220132, rt:"3h 47m", spent:9864000, roi:8.4, status:"go", item:"Patagonian Fossil", qty:18, unit:46269, note:"leave at 02:20 to land right after the restock" },
+  { name:"United Kingdom", city:"London", timed:true, leave:"02:17", src:"cloud · high", profit:742463, pph:205289, rt:"3h 37m", spent:14886000, roi:5.0, status:"go", item:"Xanax", qty:18, unit:41248, note:"leave at 02:17 to land right after the restock" },
+  { name:"Japan", city:"Tokyo", timed:true, leave:"12:10", src:"cloud · high", profit:1026700, pph:203307, rt:"5h 03m", spent:436500, roi:235.2, status:"go", item:"Hydrochloric Acid", qty:18, unit:57039, note:"leave at 12:10 to land right after the restock" },
+  { name:"South Africa", city:"Johannesburg", timed:false, leave:"now", src:"live · high", profit:1030463, pph:154957, rt:"6h 39m", spent:14598000, roi:7.1, status:"go", item:"Xanax", qty:18, unit:57248, note:"in stock" },
+  { name:"United Arab Emirates", city:"Dubai", timed:true, leave:"00:00", src:"cloud · high", profit:931307, pph:153091, rt:"6h 05m", spent:108000, roi:862.3, status:"go", item:"Tribulus Omanense", qty:18, unit:51739, note:"leave at 00:00 to land right after the restock" },
+  { name:"China", city:"Beijing", timed:false, leave:"now", src:"live · high", profit:702276, pph:129651, rt:"5h 25m", spent:510408, roi:137.6, status:"go", item:"Tiger Bone Powder", qty:18, unit:39015, note:"in stock" },
+  { name:"Canada", city:"Toronto", timed:true, leave:"00:08", src:"cloud · high", profit:115644, pph:117604, rt:"0h 59m", spent:41094, roi:281.4, status:"go", item:"Insulin", qty:18, unit:6425, note:"leave at 00:08 to land right after the restock" },
+  { name:"Cayman Islands", city:"George Town", timed:false, leave:"now", src:"live · high", profit:78359, pph:92187, rt:"0h 51m", spent:54, roi:145109, status:"go", item:"Trout", qty:18, unit:4353, note:"in stock" },
+  { name:"Mexico", city:"Ciudad Juárez", timed:true, leave:"23:07", src:"cloud · high", profit:47713, pph:73405, rt:"0h 39m", spent:180000, roi:26.5, status:"go", item:"Jaguar Plushie", qty:18, unit:2651, note:"leave at 23:07 to land right after the restock" },
+  { name:"Switzerland", city:"Zurich", timed:true, leave:"00:39", src:"cloud · high", profit:270081, pph:68375, rt:"3h 57m", spent:77094, roi:350.3, status:"go", item:"Ergotamine Ampoule", qty:18, unit:15004, note:"leave at 00:39 to land right after the restock" },
+  { name:"Hawaii", city:"Honolulu", timed:true, leave:"23:00", src:"cloud · high", profit:112499, pph:36885, rt:"3h 03m", spent:50000000, roi:0.2, status:"wait", item:"Large Suitcase", qty:5, unit:22500, note:"5 of 18 slots: the rest of the budget is gone" },
+];
+const money = (n) => "$" + Math.round(n).toLocaleString("en-US");
+const tbody = document.getElementById("rows");
+ROWS.forEach((r, i) => {
+  const tr = document.createElement("tr");
+  tr.className = "dest" + (i === 0 ? " best" : "");
+  tr.innerHTML =
+    '<td class="who"><span class="n">' + r.name + '</span><br><span class="c">' + r.city + '</span></td>' +
+    '<td><span class="depart' + (r.timed ? "" : " go") + '">' + (r.timed ? r.leave : "leave now") + '</span><br><span class="dim" style="font-size:10px">' + r.src + '</span></td>' +
+    '<td class="st"><span class="dot ' + r.status + '"></span>' + (r.timed ? "restock" : "in stock") + '</td>' +
+    '<td class="' + (r.profit >= 0 ? "pos" : "neg") + '">' + money(r.profit) + '</td>' +
+    '<td class="pos">' + money(r.pph) + '/h</td>' +
+    '<td class="hide-sm dim">' + r.rt + '</td>' +
+    '<td class="hide-sm dim">' + money(r.spent) + '</td>' +
+    '<td class="hide-sm dim">' + r.roi.toLocaleString("en-US") + '%</td>';
+  const detail = document.createElement("tr");
+  detail.className = "detail";
+  detail.innerHTML = '<td colspan="8"><div class="line">' +
+    '<span>Buy <b>' + r.item + ' x' + r.qty + '</b></span>' +
+    '<span>per unit <b class="pos">+' + money(r.unit) + '</b></span>' +
+    '<span>' + r.qty + '/' + 18 + ' slots</span>' +
+    '<span>capital ' + money(r.spent) + '</span>' +
+    '<span>round trip ' + r.rt + '</span></div>' +
+    '<div class="note">' + r.note + '</div></td>';
+  tr.tabIndex = 0;
+  tr.setAttribute("role", "button");
+  tr.setAttribute("aria-expanded", "false");
+  const toggleDetail = () => {
+    detail.classList.toggle("open");
+    tr.setAttribute("aria-expanded", detail.classList.contains("open") ? "true" : "false");
+  };
+  tr.addEventListener("click", toggleDetail);
+  tr.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggleDetail(); }
+  });
+  tbody.appendChild(tr);
+  tbody.appendChild(detail);
+});
+// settings: a chip strip that expands on demand
+document.getElementById("adjust").addEventListener("click", (e) => {
+  const s = document.getElementById("settings");
+  s.classList.toggle("open");
+  e.target.textContent = s.classList.contains("open") ? "Hide settings" : "Adjust settings";
+});
+document.getElementById("usecash").addEventListener("click", (e) => {
+  document.getElementById("bud").value = "12,345,678";
+  e.target.textContent = "Copied";
+  e.target.disabled = true;
+});
+// sortable board: click a header to re-sort, the anchor number is the leave time
+const KEYMAP = ["name", "leave", "status", "profit", "pph", "rt", "spent", "roi"];
+document.querySelectorAll("thead th").forEach((th, idx) => {
+  th.addEventListener("click", () => {
+    const key = KEYMAP[idx];
+    const numeric = ["profit", "pph", "spent", "roi"].includes(key);
+    const sorted = [...document.querySelectorAll("tr.dest")].sort((a, b) => {
+      const va = numeric ? Number(a.children[idx].textContent.replace(/[^0-9.-]/g, "")) : a.children[idx].textContent;
+      const vb = numeric ? Number(b.children[idx].textContent.replace(/[^0-9.-]/g, "")) : b.children[idx].textContent;
+      return typeof va === "number" ? vb - va : String(va).localeCompare(String(vb));
+    });
+    const frag = document.createDocumentFragment();
+    // capture the detail row BEFORE moving the main row, or nextElementSibling is
+    // null once the row is detached and the row is lost in a fragment
+    sorted.forEach((tr) => {
+      const det = tr.nextElementSibling;
+      frag.appendChild(tr);
+      if (det && det.classList.contains("detail")) frag.appendChild(det);
+    });
+    tbody.appendChild(frag);
+    document.querySelectorAll("thead th").forEach((h) => h.removeAttribute("aria-sort"));
+    th.setAttribute("aria-sort", "descending");
+  });
+});
+</script>
+</body>
+</html>

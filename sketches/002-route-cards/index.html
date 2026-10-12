@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Torn Travel Planner · Variant B · Route cards</title>
+<style>
+  /* Design read: same panel, content-first instead of tool-first. Reading order is
+     the recommendation, then the buy list; no grid, so nothing truncates on a phone.
+     Dial: ENERGY 2 / RHYTHM 2 / MOTION 1.
+     Colour: neutrals + ONE accent (green = money up and the hero card).
+     Amber is a status dot for "catch a restock", not decoration. */
+  :root{
+    --bg:#0f1319; --card:#171d25; --card-2:#1d242e; --line:#2c3541; --line-soft:#232b35;
+    --ink:#eef2f7; --ink-2:#a3adba; --ink-3:#8d97a6;
+    --accent:#4ec06f; --accent-ink:#0f1319; --neg:#f2545b; --amber:#d7a33c;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0a0d12;color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.5;padding:22px 16px 40px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:880px;margin:0 auto}
+  .caption{color:var(--ink-3);font-size:11px;margin:0 0 12px 2px}
+  .caption b{color:var(--ink-2)}
+  .panel{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:14px}
+
+  .bar{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+  .bar h1{font-size:14px;font-weight:650}
+  .bar .tabs{margin-left:auto;display:flex;gap:14px;font-size:13px}
+  .bar .tabs button{background:none;border:0;color:var(--ink-3);font:inherit;cursor:pointer;padding:0 0 2px}
+  .bar .tabs button[aria-current="true"]{color:var(--ink);box-shadow:inset 0 -2px 0 var(--accent)}
+
+  /* the one focal point: the route to fly now */
+  .hero{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px 18px;position:relative;overflow:hidden}
+  .hero::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}
+  .hero .kicker{color:var(--accent);font-size:11px;font-weight:650;letter-spacing:.6px;text-transform:uppercase}
+  .hero h2{font-size:24px;font-weight:650;margin:6px 0 2px}
+  .hero h2 small{font-size:13px;font-weight:400;color:var(--ink-3);margin-left:8px}
+  .hero .answer{display:flex;flex-wrap:wrap;align-items:flex-end;gap:26px;margin:14px 0 4px}
+  .stat .lbl{color:var(--ink-3);font-size:11px}
+  .stat .val{font-size:26px;font-weight:650;line-height:1.15}
+  .stat .val.sm{font-size:17px;font-weight:600}
+  .hero .val.accent{color:var(--accent)}
+  .hero .clock{font-family:var(--mono)}
+  .countdown{color:var(--ink-2);font-size:12px;margin-top:2px}
+  .hero .buy{margin-top:14px;padding-top:12px;border-top:1px solid var(--line-soft);display:flex;flex-wrap:wrap;gap:8px 22px;align-items:center;font-size:13px}
+  .hero .buy .pill{display:inline-flex;align-items:center;gap:6px;background:var(--card-2);border:1px solid var(--line);border-radius:999px;padding:3px 11px}
+  .hero .buy .dot{width:7px;height:7px;border-radius:50%;background:var(--amber)}
+
+  h3.sec{font-size:11px;color:var(--ink-3);font-weight:600;letter-spacing:.5px;text-transform:uppercase;margin:20px 0 8px}
+  .list{display:grid;gap:8px;grid-template-columns:1fr 1fr}
+  @media (max-width:640px){ .list{grid-template-columns:1fr} }
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:11px 13px;cursor:pointer}
+  .card:hover{border-color:#3a4553;background:var(--card-2)}
+  .card .top{display:flex;align-items:baseline;gap:10px}
+  .card .nm{font-weight:600}
+  .card .ct{color:var(--ink-3);font-size:12px}
+  .card .pph{margin-left:auto;font-variant-numeric:tabular-nums;font-weight:650;color:var(--accent);white-space:nowrap}
+  .card .line2{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:5px;font-size:12px;color:var(--ink-2)}
+  .card .leave{font-family:var(--mono)}
+  .card .more{display:none;margin-top:9px;padding-top:9px;border-top:1px solid var(--line-soft);font-size:12px;color:var(--ink-2)}
+  .card.open .more{display:block}
+  .card .more .note{font-family:var(--mono);color:var(--ink-3);margin-top:4px;font-size:11px}
+  .tag{display:inline-block;font-size:10px;border:1px solid var(--line);border-radius:3px;padding:0 5px;color:var(--ink-3)}
+  .tag.catch{color:var(--amber);border-color:rgba(215,163,60,.45)}
+  .pos{color:var(--accent)} .neg{color:var(--neg)} .dim{color:var(--ink-3)}
+
+  details.settings{margin-top:20px;background:var(--card);border:1px solid var(--line);border-radius:8px}
+  details.settings>summary{cursor:pointer;padding:11px 13px;font-size:13px;color:var(--ink-2);list-style:none}
+  details.settings>summary::-webkit-details-marker{display:none}
+  details.settings>summary::before{content:"▸ ";color:var(--ink-3)}
+  details.settings[open]>summary::before{content:"▾ "}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;padding:0 13px 15px}
+  .fld label{display:block;font-size:11px;color:var(--ink-3);margin-bottom:4px}
+  .fld input,.fld select{width:100%;background:#0b0f14;border:1px solid var(--line);color:var(--ink);border-radius:5px;padding:5px 8px;font-size:13px}
+  .fld input:focus,.fld select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(78,192,111,.18)}
+  .fld .sub{display:flex;align-items:center;gap:7px;margin-top:5px}
+  .fld .sub span{font-size:10px;color:var(--ink-3)}
+  button.ghost{background:var(--card-2);border:1px solid var(--line);color:var(--ink);border-radius:5px;font:inherit;font-size:11px;padding:3px 9px;cursor:pointer}
+  button.ghost:hover{border-color:var(--accent);color:#fff}
+  button.ghost:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .foot{margin-top:14px;color:var(--ink-3);font-size:11px;display:flex;flex-wrap:wrap;gap:4px 16px}
+  .foot code{font-family:var(--mono);color:var(--ink-2)}
+  .card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  /* Touch: Torn is played on PDA, so controls and cards clear the 44px tap target. */
+  @media (max-width:640px), (pointer:coarse){
+    button.ghost,details.settings>summary,.fld input,.fld select{min-height:44px}
+    .card{padding:14px 15px}
+    .bar .tabs button{min-height:44px;padding:11px 2px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="caption">Variant B · <b>Route cards</b> · content-first, the answer and its buy list get the space; real planner snapshot.</p>
+  <div class="panel">
+    <div class="bar">
+      <h1>Travel planner</h1>
+      <div class="tabs">
+        <button aria-current="true">Routes</button>
+        <button>Item tracker</button>
+      </div>
+    </div>
+
+    <div class="hero">
+      <div class="kicker">Fly this</div>
+      <h2>Argentina <small>Buenos Aires</small></h2>
+      <div class="answer">
+        <div class="stat">
+          <div class="lbl">Leave at</div>
+          <div class="val clock">02:20</div>
+          <div class="countdown" id="cd">in 3h 24m</div>
+        </div>
+        <div class="stat">
+          <div class="lbl">Profit per trip</div>
+          <div class="val accent">$832,834</div>
+        </div>
+        <div class="stat">
+          <div class="lbl">Per hour</div>
+          <div class="val sm">$220,132</div>
+        </div>
+        <div class="stat">
+          <div class="lbl">Capital</div>
+          <div class="val sm">$9,864,000</div>
+          <div class="countdown">ROI 8.4%</div>
+        </div>
+      </div>
+      <div class="buy">
+        <span class="pill"><span class="dot"></span> catch the restock on landing</span>
+        <span>Buy <b>Patagonian Fossil ×18</b></span>
+        <span class="pos">+$46,269</span> <span class="dim">per unit</span>
+        <span class="dim">round trip 3h 47m</span>
+      </div>
+    </div>
+
+    <h3 class="sec">Other options</h3>
+    <div class="list" id="list"></div>
+
+    <details class="settings">
+      <summary>Settings · Airstrip · 18 slots · net 97% · $50,000,000 capital · confidence med</summary>
+      <div class="grid">
+        <div class="fld"><label for="mode">Travel method</label>
+          <select id="mode"><option>Airstrip</option><option>Standard</option><option>WLT</option><option>Business</option></select></div>
+        <div class="fld"><label for="cap">Item capacity</label><input id="cap" value="18"></div>
+        <div class="fld"><label for="net">Net % (trade)</label><input id="net" value="97"></div>
+        <div class="fld"><label for="bud">Budget (capital)</label><input id="bud" value="50,000,000">
+          <div class="sub"><span>cash on hand [from your key]</span><button class="ghost" id="usecash">Use my money</button></div></div>
+        <div class="fld"><label for="buf">Buy buffer (min)</label><input id="buf" value="5"></div>
+        <div class="fld"><label for="start">Active start</label><input id="start" value="22:56"></div>
+        <div class="fld"><label for="end">Active end</label><input id="end" placeholder="off"></div>
+        <div class="fld"><label for="sleep">Sleep (h)</label><input id="sleep" value="8"></div>
+        <div class="fld"><label for="win">Stock window (min)</label><input id="win" value="-1"></div>
+        <div class="fld"><label for="conf">Restock confidence</label>
+          <select id="conf"><option>Med</option><option>High</option><option>Low</option></select></div>
+        <div class="fld"><label for="api">API key</label><input id="api" type="password" placeholder="Paste your key"></div>
+        <div class="fld"><label>&nbsp;</label><button class="ghost" id="refresh" style="width:100%;padding:6px">Refresh now</button></div>
+      </div>
+      <div style="padding:0 13px 14px;color:var(--ink-3);font-size:11px">Item tracker: track up to 10 items and get an exact leave time per destination.</div>
+    </details>
+
+    <div class="foot">
+      <span>Feed <code>3s old</code></span>
+      <span>Snapshot 2026-10-12 22:56 local</span>
+    </div>
+  </div>
+</div>
+<script>
+const ROWS = [
+  { name:"United Kingdom", city:"London", timed:true, leave:"02:17", profit:742463, pph:205289, rt:"3h 37m", spent:14886000, roi:5.0, item:"Xanax", qty:18, unit:41248, note:"leave at 02:17 to land right after the restock" },
+  { name:"Japan", city:"Tokyo", timed:true, leave:"12:10", profit:1026700, pph:203307, rt:"5h 03m", spent:436500, roi:235.2, item:"Hydrochloric Acid", qty:18, unit:57039, note:"leave at 12:10 to land right after the restock" },
+  { name:"South Africa", city:"Johannesburg", timed:false, leave:"now", profit:1030463, pph:154957, rt:"6h 39m", spent:14598000, roi:7.1, item:"Xanax", qty:18, unit:57248, note:"in stock now, still there when you land" },
+  { name:"United Arab Emirates", city:"Dubai", timed:true, leave:"00:00", profit:931307, pph:153091, rt:"6h 05m", spent:108000, roi:862.3, item:"Tribulus Omanense", qty:18, unit:51739, note:"leave at 00:00 to land right after the restock" },
+  { name:"China", city:"Beijing", timed:false, leave:"now", profit:702276, pph:129651, rt:"5h 25m", spent:510408, roi:137.6, item:"Tiger Bone Powder", qty:18, unit:39015, note:"in stock now, still there when you land" },
+  { name:"Canada", city:"Toronto", timed:true, leave:"00:08", profit:115644, pph:117604, rt:"0h 59m", spent:41094, roi:281.4, item:"Insulin", qty:18, unit:6425, note:"leave at 00:08 to land right after the restock" },
+  { name:"Cayman Islands", city:"George Town", timed:false, leave:"now", profit:78359, pph:92187, rt:"0h 51m", spent:54, roi:145109, item:"Trout", qty:18, unit:4353, note:"in stock now, 18 slots for $54" },
+  { name:"Mexico", city:"Ciudad Juárez", timed:true, leave:"23:07", profit:47713, pph:73405, rt:"0h 39m", spent:180000, roi:26.5, item:"Jaguar Plushie", qty:18, unit:2651, note:"leave at 23:07 to land right after the restock" },
+  { name:"Switzerland", city:"Zurich", timed:true, leave:"00:39", profit:270081, pph:68375, rt:"3h 57m", spent:77094, roi:350.3, item:"Ergotamine Ampoule", qty:18, unit:15004, note:"leave at 00:39 to land right after the restock" },
+  { name:"Hawaii", city:"Honolulu", timed:true, leave:"23:00", profit:112499, pph:36885, rt:"3h 03m", spent:50000000, roi:0.2, item:"Large Suitcase", qty:5, unit:22500, note:"only 5 of 18 slots: the budget is spent" },
+];
+const money = (n) => "$" + Math.round(n).toLocaleString("en-US");
+const list = document.getElementById("list");
+ROWS.forEach((r) => {
+  const c = document.createElement("div");
+  c.className = "card";
+  c.innerHTML =
+    '<div class="top"><span class="nm">' + r.name + '</span><span class="ct">' + r.city + '</span>' +
+    '<span class="pph">' + money(r.pph) + '/h</span></div>' +
+    '<div class="line2"><span>' + (r.timed ? 'leave <span class="leave">' + r.leave + '</span>' : 'leave <span class="leave">now</span>') + '</span>' +
+    '<span>' + money(r.profit) + ' per trip</span>' +
+    '<span class="dim">' + r.rt + '</span></div>' +
+    '<div class="more"><span>Buy <b>' + r.item + ' x' + r.qty + '</b> <span class="pos">+' + money(r.unit) + '</span> per unit, ' +
+    money(r.spent) + ' capital, ROI ' + r.roi.toLocaleString("en-US") + '%</span>' +
+    '<div class="note">' + r.note + '</div></div>' +
+    (r.timed ? '<div style="margin-top:6px"><span class="tag catch">catch restock</span></div>' : '');
+  const toggleCard = () => {
+    c.classList.toggle("open");
+    c.setAttribute("aria-expanded", c.classList.contains("open") ? "true" : "false");
+  };
+  c.tabIndex = 0;
+  c.setAttribute("role", "button");
+  c.setAttribute("aria-expanded", "false");
+  c.addEventListener("click", toggleCard);
+  c.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggleCard(); }
+  });
+  list.appendChild(c);
+});
+document.getElementById("usecash").addEventListener("click", (e) => {
+  document.getElementById("bud").value = "12,345,678";
+  e.target.textContent = "Copied";
+  e.target.disabled = true;
+});
+// live countdown to the hero's departure: the decision is a moment, not a clock reading
+let secs = 3 * 3600 + 24 * 60;
+setInterval(() => {
+  secs = Math.max(0, secs - 1);
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  document.getElementById("cd").textContent = secs ? "in " + h + "h " + m + "m " + s + "s" : "leave now";
+}, 1000);
+</script>
+</body>
+</html>
