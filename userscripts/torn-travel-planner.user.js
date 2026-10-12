@@ -3170,8 +3170,8 @@
 #ttp-root .ttp-hero::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}
 #ttp-root .ttp-kicker{display:block;color:var(--accent);font-size:11px;font-weight:650;letter-spacing:.5px;text-transform:uppercase}
 #ttp-root .ttp-hero-top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:6px 0 0}
-#ttp-root .ttp-hero h2{font-size:22px;font-weight:650;letter-spacing:-.2px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
-#ttp-root .ttp-hero h2 small{font-size:12px;font-weight:400;color:var(--ink-3);letter-spacing:0}
+#ttp-root .ttp-hero h2,#ttp-root .ttp-card h2{font-size:22px;font-weight:650;letter-spacing:-.2px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+#ttp-root .ttp-hero h2 small,#ttp-root .ttp-card h2 small{font-size:12px;font-weight:400;color:var(--ink-3);letter-spacing:0}
 #ttp-root .ttp-answer{display:flex;flex-wrap:wrap;gap:22px;margin:14px 0 0}
 #ttp-root .ttp-answer-sm{gap:18px;margin-top:10px}
 #ttp-root .ttp-stat{display:flex;flex-direction:column;gap:1px;min-width:78px}
@@ -3246,10 +3246,12 @@
 #ttp-root .ttp-track-row .leave.go{color:var(--accent)}
 #ttp-root .ttp-track-row .dim{color:var(--ink-3)}
 
-/* minimized button */
-#ttp-root .ttp-mini{display:none;position:fixed;left:8px;z-index:100000;width:46px;height:46px;border-radius:50%;
-  background:var(--panel);border:2px solid var(--accent);color:var(--accent);cursor:pointer;
+/* minimized button: appended to document.body, OUTSIDE #ttp-root (it has to survive
+   #ttp-root being hidden), so it cannot rely on the token block or a #ttp-root prefix */
+.ttp-mini{display:none;position:fixed;left:8px;z-index:100000;width:46px;height:46px;border-radius:50%;
+  background:#161b22;border:2px solid #3fb950;color:#3fb950;cursor:pointer;
   box-shadow:0 4px 14px rgba(0,0,0,.55);align-items:center;justify-content:center;touch-action:none;user-select:none}
+.ttp-mini:focus-visible{outline:2px solid #3fb950;outline-offset:2px}
 
 /* help overlay */
 #ttp-help{position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.65);display:flex;align-items:center;
