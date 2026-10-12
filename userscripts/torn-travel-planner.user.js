@@ -212,7 +212,11 @@
           try {
             const data = JSON.parse(resp.responseText);
             if (data && data.error && typeof data.error === "object" && data.error.error) {
-              reject(new Error("API Error: " + data.error.error));
+              // Carry the Torn error code so callers can tell "key access too
+              // low" (16) from a real failure.
+              const err = new Error("API Error: " + data.error.error);
+              err.code = data.error.code;
+              reject(err);
             } else {
               resolve(data);
             }
@@ -269,25 +273,43 @@
     }
   }
 
-  // Current nerve from the user's own API key ('' = disabled).
-  async function fetchNerve(force) {
+  // Nerve comes from the bars selection, NOT basic: basic returns only
+  // level/gender/player_id/name/status, so the old `nerve.nerve` /
+  // `nerve_maximum` / `nerve_fulltime` reads were all undefined and the nerve
+  // warning could never fire. bars returns
+  // {current, maximum, increment, interval, ticktime, fulltime} (the last two
+  // are relative seconds, not timestamps).
+  function normalizeBars(data) {
+    const n = data && data.nerve;
+    if (!n || typeof n.current !== "number" || typeof n.maximum !== "number") return null;
+    const perNerveSec = n.increment > 0 && n.interval > 0 ? n.interval / n.increment : 300;
+    return {
+      nerve: n.current,
+      nerve_maximum: n.maximum,
+      // Unix seconds when the bar is full (nerveInfo wants an absolute time).
+      nerve_fulltime: Math.floor(Date.now() / 1000) + Math.max(0, (n.maximum - n.current) * perNerveSec),
+    };
+  }
+
+  async function fetchBars(force) {
     const key = state.apiKey;
     if (!key) return null;
     if (!force && ttpInBackoff()) return null; // cool-down after error, skip
-    const url = "https://api.torn.com/user/?selections=basic&key=" + encodeURIComponent(key);
+    const url = "https://api.torn.com/user/?selections=bars&key=" + encodeURIComponent(key);
     if (!force) {
       const cached = getCached(url);
       if (cached) return cached;
     }
     try {
       const data = await gmFetch(url);
-      if (!data || data.error || data.nerve == null) {
+      const bars = normalizeBars(data);
+      if (!bars) {
         ttpApiErr();
         return null;
       }
-      apiCache[url] = { data: data, ts: Date.now() };
+      apiCache[url] = { data: bars, ts: Date.now() };
       ttpApiOk();
-      return data;
+      return bars;
     } catch (e) {
       ttpApiErr();
       return null;
@@ -295,8 +317,60 @@
   }
 
   // Non-fatal: a missing/invalid API key must not break price/stock planning.
-  async function fetchNerveSafe(force) {
-    return (await fetchNerve(force)) || null;
+  async function fetchBarsSafe(force) {
+    return (await fetchBars(force)) || null;
+  }
+
+  // Money on hand. This is its OWN request: money needs at least Limited key
+  // access, and Torn answers error 16 for the whole response when one selection
+  // is out of reach, so sharing a request with bars would take the nerve read
+  // down with it. Returns {state, amount} with state one of
+  // ok | nokey | toolow | error (never throws).
+  function moneyOnHand(data) {
+    if (!data) return null;
+    if (typeof data.money_onhand === "number") return data.money_onhand;
+    if (typeof data.money === "number") return data.money;
+    if (data.money && typeof data.money.money_onhand === "number") return data.money.money_onhand;
+    return null;
+  }
+  let _cashKey = null; // key the cached access verdict was decided for
+  let _cash = { state: "nokey", amount: null };
+
+  async function fetchCash(force) {
+    const key = state.apiKey;
+    if (!key) return { state: "nokey", amount: null };
+    // A key that can't read money won't start being able to until it changes,
+    // so don't re-ask the API every refresh.
+    if (_cashKey === key && _cash.state === "toolow" && !force) return _cash;
+    const url = "https://api.torn.com/user/?selections=money&key=" + encodeURIComponent(key);
+    if (!force) {
+      const cached = getCached(url);
+      if (cached) {
+        _cashKey = key;
+        _cash = cached;
+        return cached;
+      }
+    }
+    let out;
+    try {
+      const data = await gmFetch(url);
+      const amount = moneyOnHand(data);
+      out = amount == null ? { state: "error", amount: null } : { state: "ok", amount: amount };
+    } catch (e) {
+      out = e && e.code === 16 ? { state: "toolow", amount: null } : { state: "error", amount: null };
+    }
+    _cashKey = key;
+    _cash = out;
+    if (out.state !== "error") apiCache[url] = { data: out, ts: Date.now() };
+    return out;
+  }
+
+  async function fetchCashSafe(force) {
+    try {
+      return await fetchCash(force);
+    } catch (e) {
+      return { state: "error", amount: null };
+    }
   }
 
   async function fetchItems(force) {
@@ -334,7 +408,7 @@
   const hours = (min) => {
     const h = Math.floor(min / 60),
       m = Math.round(min % 60);
-    return h > 0 ? h + "h " + (m ? m + "m" : "") : m + "m";
+    return h > 0 ? h + "h" + (m ? " " + m + "m" : "") : m + "m";
   };
   const pphStr = (n) => "$" + Math.round(n).toLocaleString() + "/h";
 
@@ -373,18 +447,42 @@
   const MAX_RESTOCKS = 40;
   const MEDIA_URL = "https://travel.mediabros.cc"; // shared 24/7 restock logger (Spud Travel backend)
 
+  // The history blob is hundreds of KB, and the planner reads it per item from
+  // inside nested loops, so JSON.parse-ing it on every lookup froze the tab for
+  // seconds on each settings change (measured: ~2.5s with a 4h-old history).
+  // Keep the parsed object in memory instead, and coalesce writes to one
+  // localStorage.setItem per second.
+  const HISTORY_FLUSH_MS = 1000;
+  let _history = null;
+  let _historyDirty = false;
+  let _historyFlushTimer = null;
   function getHistory() {
+    if (_history) return _history;
     try {
-      return JSON.parse(localStorage.getItem(HIST_KEY) || "{}");
+      _history = JSON.parse(localStorage.getItem(HIST_KEY) || "{}");
     } catch (e) {
-      return {};
+      _history = {};
     }
+    return _history;
   }
   function saveHistory(h) {
+    _history = h;
+    _historyDirty = true;
+    if (_historyFlushTimer) return;
+    _historyFlushTimer = setTimeout(() => {
+      _historyFlushTimer = null;
+      flushHistory();
+    }, HISTORY_FLUSH_MS);
+  }
+  // Write pending records out now (also called on tab hide/close so a pending
+  // change isn't lost between flushes).
+  function flushHistory() {
+    if (!_historyDirty || !_history) return;
+    _historyDirty = false;
     try {
-      localStorage.setItem(HIST_KEY, JSON.stringify(h));
+      localStorage.setItem(HIST_KEY, JSON.stringify(_history));
     } catch (e) {
-      /* ignore */
+      /* ignore (quota / private mode) */
     }
   }
 
@@ -1015,7 +1113,6 @@
       // --- Candidate items with real net profit, buying only what is in stock on arrival ---
       const arrivalMs = nowMs + oneWay * 60000;
       const cands = [];
-      const candsById = {};
       let rowDepart = null;
       for (const s of stock) {
         const it = items[s.id];
@@ -1045,44 +1142,127 @@
           s, // original feed entry - needed for departure planning
           entry,
         });
-        candsById[s.id] = cands[cands.length - 1];
       }
       cands.sort((a, b) => b.unitNet - a.unitNet);
 
-      // --- Budget allocation (greedy by unit net), capped by flight capacity ---
-      let remaining = state.budget;
-      const buyList = [];
-      let slotsUsed = 0;
-      for (const c of cands) {
-        if (remaining < 1) break;
-        const bySlots = cap - slotsUsed;
-        const perCap = Math.min(c.stockQty, cap);
-        const byBudget = Math.floor(remaining / c.cost);
-        const qty = Math.min(perCap, byBudget, bySlots);
-        if (qty <= 0) {
-          if (cap > 0 && slotsUsed >= cap) break; // flight capacity full
-          continue;
-        }
-        buyList.push({
-          id: c.id,
-          name: c.name,
-          qty,
-          cost: c.cost,
-          unitNet: c.unitNet,
-          profit: c.unitNet * qty,
-          spent: c.cost * qty,
-          landing: c.landing,
+      // --- Items you can only get by leaving LATER (land right after a restock) ---
+      // landingAvailability() calls these "empty at landing" (their restock lands
+      // after you would arrive now), so the arrival-now filter above threw them
+      // away, and departurePlan() is only consulted for items already in the buy
+      // list. The one function that can time a departure could therefore never see
+      // the item that needed it, which hid the most profitable item in the country
+      // from the table and scored each route on the leftovers. Japan: Xanax at
+      // +$100,248/unit was never mentioned, only the $437k Chopsticks plan.
+      const timedCands = [];
+      for (const s of stock) {
+        const it = items[s.id];
+        if (!it) continue;
+        if (it.tradeable === false) continue;
+        const mv = parseFloat(it.market_value);
+        if (!(mv > 0)) continue;
+        const received = mv * netPct;
+        const unitNet = received - s.cost;
+        if (unitNet <= 0) continue;
+        const entry = models && models[key] ? models[key][s.id] : null;
+        const dep = departurePlan(s, entry, nowMs, oneWay, key, state.stockWindow);
+        if (!dep || dep.status !== "timed") continue; // buyable on arrival is handled above
+        const lvl = dep.source ? dep.source.level : "low";
+        // Same confidence gate the out-of-stock path uses: never time a departure
+        // to a restock estimate we would not trust.
+        if (confRank(state.restockConfidence || "med") > confRank(lvl)) continue;
+        const shelf =
+          modelRestockQty(entry) ||
+          (typeof s.quantity === "number" && s.quantity > 0 ? s.quantity : cap * 3);
+        // Landing right after the restock, so nothing has sold out yet.
+        const qty = Math.floor(
+          restockSurvival(shelf, entry && entry.sellRate, dep.landAtMs, dep.landAtMs),
+        );
+        if (!(qty > 0)) continue;
+        timedCands.push({
+          id: s.id,
+          name: it.name || "#" + s.id,
+          stockQty: qty,
+          cost: s.cost,
+          received,
+          unitNet,
+          s,
+          entry,
+          departAtMs: dep.departAtMs,
+          landing: {
+            status: "restock",
+            qty,
+            timed: true, // catch it by leaving later
+            leaveAtMs: dep.departAtMs,
+            landAtMs: dep.landAtMs,
+            restockIn: Math.max(0, Math.round((dep.landAtMs - nowMs) / 60000)),
+            beforeLanding: 0,
+            conf: { level: lvl, label: dep.source ? dep.source.label : "low" },
+            note: "leave at " + localHHMM(dep.departAtMs) + " to land right after the restock",
+          },
         });
-        remaining -= c.cost * qty;
-        slotsUsed += qty;
+      }
+      timedCands.sort((a, b) => b.unitNet - a.unitNet);
+
+      // --- Budget allocation, capped by flight capacity ---
+      // Two greedy orders, keep the better list: unit-net order can strand a small
+      // budget on one expensive item, ROI order can leave slots empty with money
+      // unspent. The better of the two beats either alone (measured: Mexico on a
+      // $100k budget earned 18% more when the ROI order won).
+      function allocate(pool) {
+        const byUnit = [...pool].sort((a, b) => b.unitNet - a.unitNet);
+        const ratio = (c) => (c.cost > 0 ? c.unitNet / c.cost : Infinity);
+        const byRoi = [...pool].sort((a, b) => ratio(b) - ratio(a) || b.unitNet - a.unitNet);
+        let best = null;
+        for (const order of [byUnit, byRoi]) {
+          let remaining = state.budget;
+          let slots = 0;
+          const list = [];
+          for (const c of order) {
+            if (remaining < 1) break;
+            const perCap = Math.min(c.stockQty, cap);
+            const byBudget = Math.floor(remaining / c.cost);
+            const qty = Math.min(perCap, byBudget, cap - slots);
+            if (qty <= 0) {
+              if (cap > 0 && slots >= cap) break; // flight capacity full
+              continue;
+            }
+            list.push({
+              id: c.id,
+              name: c.name,
+              qty,
+              cost: c.cost,
+              unitNet: c.unitNet,
+              profit: c.unitNet * qty,
+              spent: c.cost * qty,
+              landing: c.landing,
+            });
+            remaining -= c.cost * qty;
+            slots += qty;
+          }
+          let profit = 0,
+            spend = 0;
+          for (const b of list) {
+            profit += b.profit;
+            spend += b.spent;
+          }
+          const plan = { buyList: list, tripProfit: profit, budgetSpent: spend, slots };
+          if (!best || plan.tripProfit > best.tripProfit) best = plan;
+        }
+        return best;
       }
 
-      let tripProfit = 0,
-        budgetSpent = 0;
-      for (const b of buyList) {
-        tripProfit += b.profit;
-        budgetSpent += b.spent;
-      }
+      // Catch a restock only when that earns more than buying what is on the shelf
+      // today; otherwise the plain arrival plan stands. This mirrors the
+      // now-vs-timed choice computeSleepPlan already makes.
+      const nowPlan = allocate(cands);
+      const timedPlan = timedCands.length ? allocate(timedCands) : null;
+      const useTimed =
+        !!timedPlan && timedPlan.tripProfit - travelCost > nowPlan.tripProfit - travelCost;
+      const pool = useTimed ? timedCands : cands;
+      const buyList = (useTimed ? timedPlan : nowPlan).buyList;
+      const tripProfit = (useTimed ? timedPlan : nowPlan).tripProfit;
+      const budgetSpent = (useTimed ? timedPlan : nowPlan).budgetSpent;
+      const slotsUsed = (useTimed ? timedPlan : nowPlan).slots;
       const tripProfitNet = tripProfit - travelCost; // after travel cost (only standard)
 
       const roundTripMin = 2 * oneWay + buffer; // in + out + buy buffer
@@ -1099,9 +1279,9 @@
       // trip-1 list repeats verbatim; without a depletion rate the flat
       // trips × trip-profit estimate is kept (no invented numbers).
       let windowProfit = trips * tripProfitNet;
-      if (trips > 1 && cands.length) {
+      if (trips > 1 && pool.length) {
         const sim = simulateWindowProfit(
-          cands,
+          pool,
           trips,
           roundTripMin,
           cap,
@@ -1115,10 +1295,14 @@
       const nrv = nerveInfo(roundTripMin, nerve);
 
       // Departure guidance: prefer an item that is buyable on arrival ("now");
-      // otherwise the earliest timed departure across the whole buy list.
+      // otherwise the earliest timed departure across the chosen buy list. When a
+      // timed plan won above, every item in it departs in the future, so the
+      // earliest one is what the Depart column shows.
+      const poolById = new Map();
+      for (const c of pool) poolById.set(c.id, c);
       let timedDepart = null;
       for (const b of buyList) {
-        const c0 = candsById[b.id];
+        const c0 = poolById.get(b.id);
         if (!c0) continue;
         const dep = departurePlan(c0.s, c0.entry, nowMs, oneWay, key, state.stockWindow);
         if (!dep) continue;
@@ -1134,6 +1318,7 @@
         key,
         name: dc.name,
         city: dc.city,
+        kind: useTimed ? "timed" : "now", // "timed" = leave later to catch a restock
         oneWay,
         travelCost,
         cap,
@@ -1439,6 +1624,8 @@
     tableWrap = null; // eslint-disable-line no-unused-vars
   let miniButtonEl = null;
   let panelMinimized = false;
+  let cashTxtEl = null,
+    cashBtnEl = null; // cash-on-hand readout + "use it as capital" button
   // Tab + item tracker refs
   let plannerWrap = null,
     trackerWrap = null,
@@ -1469,6 +1656,14 @@
   function landingTag(ld) {
     if (!ld) return "";
     const conf = ld.conf ? ld.conf.label : "";
+    // Leave-later plan: the restock lands after you would arrive now, so the
+    // departure time is the actionable bit, not the arrival.
+    if (ld.status === "restock" && ld.timed) {
+      return (
+        badge("CATCH RESTOCK", "wait", ld.note + (conf ? " (" + conf + ")" : "")) +
+        (conf ? ` <span class="ttp-conf">${conf}</span>` : "")
+      );
+    }
     if (ld.status === "restock") {
       const before = ld.beforeLanding != null ? ld.beforeLanding : "?";
       const inMin = ld.restockIn != null ? ld.restockIn : "?";
@@ -1527,7 +1722,13 @@
           (best.roi != null ? best.roi.toFixed(1) + "%" : "—");
       html += `<div class="ttp-reco" style="background:rgba(40,167,69,0.12);border:1px solid rgba(40,167,69,0.5);border-radius:6px;padding:8px 10px;margin-bottom:8px;">`;
       html += `<div style="font-weight:bold;color:#28a745;">★ Recommended route${useWindow ? " (active window)" : ""}</div>`;
-      html += `<div><b>${best.name} (${best.city})</b> — ${useWindow ? metric : ""}</div>`;
+      // A "timed" route means the plane has to leave later to meet a restock, so
+      // the departure time belongs next to the route, not only in the table.
+      const leaveTxt =
+        best.depart && best.depart.status === "timed"
+          ? ` · leave ${localHHMM(best.depart.departAtMs)} to catch the restock`
+          : "";
+      html += `<div><b>${best.name} (${best.city})</b> — ${metric}${leaveTxt}</div>`;
       html += `<div style="color:#bbb;font-size:12px;">${useWindow ? "PPH " + pphStr(best.pph) + " · " : ""}RT ${hours(best.roundTripMin)} · Buy: ${topBuy}</div>`;
       // Departure times live in the table's "Depart (local)" column — the
       // recommended route is always the top row there, so no duplicate here.
@@ -1816,6 +2017,7 @@
     updateItemOptions();
     buildTracker();
     updateStatus();
+    updateCash();
     if (statusEl) statusEl.style.color = "#bbb";
   }
 
@@ -1905,9 +2107,32 @@
       money(state.budget);
     statusEl.innerHTML = `Data ${age >= 0 ? age + "s old" : "—"} · ${mode}`;
     let suff = state.respectStock ? " · stock@arrival" : "";
-    if (lastData && lastData.nerve)
+    if (lastData && lastData.nerve && typeof lastData.nerve.nerve === "number")
       suff += " · nerve " + lastData.nerve.nerve + "/" + (lastData.nerve.nerve_maximum || 100);
     if (suff) statusEl.innerHTML += suff;
+  }
+
+  // Cash-on-hand readout. Every state is spelled out instead of leaving a blank,
+  // so a key that cannot read money says so rather than looking broken.
+  function updateCash() {
+    if (!cashTxtEl) return;
+    const c = lastData ? lastData.cash : null;
+    let text;
+    let canUse = false;
+    if (!c) text = "Cash on hand: reading…";
+    else if (c.state === "ok") {
+      text = "Cash on hand: " + money(c.amount);
+      canUse = true;
+    } else if (c.state === "nokey") text = "Cash on hand: add an API key to read it";
+    else if (c.state === "toolow") text = "Cash on hand: this key cannot read money (needs Limited access)";
+    else text = "Cash on hand: unavailable, hit Refresh to retry";
+    cashTxtEl.textContent = text;
+    if (cashBtnEl) {
+      cashBtnEl.disabled = !canUse;
+      cashBtnEl.title = canUse
+        ? "Set Budget (capital) to " + money(c.amount)
+        : "Reads money on hand from your API key; needs money access on the key";
+    }
   }
 
   // ========== LOAD / REFRESH ==========
@@ -1927,11 +2152,12 @@
         '<span style="color:#58a6ff;">⏳ Fetching abroad prices + item values + restock/nerve…</span>';
 
     try {
-      const [abroad, items, model, nerve, backend] = await Promise.all([
+      const [abroad, items, model, nerve, cash, backend] = await Promise.all([
         fetchAbroad(force),
         fetchItems(force),
         fetchModelSafe(force),
-        fetchNerveSafe(force),
+        fetchBarsSafe(force),
+        fetchCashSafe(force),
         fetchBackend(force),
       ]);
       if (seq !== updateSeq) return;
@@ -1942,6 +2168,7 @@
         items: itemMap,
         model,
         nerve,
+        cash,
         fetchedAt: Date.now(),
       };
       _backend = backend; // shared 24/7 restock predictions (may be null)
@@ -1951,6 +2178,7 @@
       if (seq !== updateSeq) return;
       if (statusEl)
         statusEl.innerHTML = '<span style="color:#dc3545;">' + (e.message || e) + "</span>";
+      updateCash(); // don't leave the readout stuck on "reading…"
     } finally {
       loading = false;
       if (seq === updateSeq) {
@@ -2033,9 +2261,9 @@
     });
     return inp;
   }
-  // Budget input: accepts short-hand (2k / 2m / 1.5b), commas while typing and
-  // plain numbers. Comma-formats on commit; invalid text shows an inline error
-  // and reverts to the last good value.
+  // Budget input: accepts short-hand (2k / 2m / 1.5b), commas and plain numbers.
+  // Commas appear as you type; invalid text shows an inline error and reverts to
+  // the last good value on commit.
   function parseMoney(raw) {
     if (raw == null) return null;
     const s = String(raw).trim().replace(/[,\s_]/g, "");
@@ -2045,6 +2273,32 @@
     const mult = m[2] ? { k: 1e3, m: 1e6, b: 1e9 }[m[2].toLowerCase()] : 1;
     const v = Math.round(parseFloat(m[1]) * mult);
     return isFinite(v) && v >= 0 ? v : null;
+  }
+  // Group a digit run in threes. String-based on purpose: a 19-digit amount
+  // would lose its tail if it went through Number first.
+  function groupDigits(digits) {
+    return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  }
+  // Re-group what the user is typing and say where the caret goes back to: it
+  // stays after the same digit it was after before the commas moved. Pure, so
+  // the harness can check the caret math.
+  function formatMoneyTyping(raw, caret) {
+    const s = String(raw);
+    const upTo = s.slice(0, caret == null ? s.length : caret);
+    const at = upTo.replace(/\D/g, "").length; // digits left of the caret
+    let digits = s.replace(/\D/g, "");
+    if (digits.length > 1) digits = digits.replace(/^0+/, ""); // no 0001234
+    if (!digits) return { text: "", caret: 0 };
+    const text = groupDigits(digits);
+    if (at <= 0) return { text, caret: 0 };
+    let seen = 0,
+      pos = 0;
+    while (pos < text.length) {
+      if (/\d/.test(text[pos])) seen++;
+      pos++;
+      if (seen === at) break;
+    }
+    return { text, caret: pos };
   }
   function moneyInput(value, onchange, w) {
     const inp = document.createElement("input");
@@ -2058,6 +2312,16 @@
     let lastValid = typeof value === "number" && isFinite(value) ? value : null;
     const fmt = (v) => (v == null ? "" : v.toLocaleString("en-US"));
     inp.addEventListener("input", () => {
+      const raw = inp.value;
+      // Plain numbers get grouped live; shorthand (2k / 1.5b) is left alone so
+      // the k/m/b can still be typed.
+      if (raw && !/[a-z]/i.test(raw) && raw.indexOf(".") === -1) {
+        const f = formatMoneyTyping(raw, inp.selectionStart);
+        if (f.text !== raw) {
+          inp.value = f.text;
+          inp.setSelectionRange(f.caret, f.caret);
+        }
+      }
       if (inp.value.trim() === "") {
         if (inp.__setErr) inp.__setErr("Enter an amount (e.g. 2m or 2,000,000)");
         return;
@@ -2085,16 +2349,17 @@
     ["Travel method", "Flight class. Airstrip / WLT / Business are FREE and faster; only Standard pays the fare shown per destination."],
     ["Item capacity", "How many items you can carry home in one trip."],
     ["Net % (trade)", "Percent of market value you actually receive when selling. 97 is typical."],
-    ["Budget (capital)", "Money you're willing to spend per trip. Short-hand works: 2m = 2,000,000, 2k = 2,000, 1.5b = 1,500,000,000. Commas are fine."],
+    ["Budget (capital)", "Money you're willing to spend per trip. Short-hand works: 2m = 2,000,000, 2k = 2,000, 1.5b = 1,500,000,000. Commas appear as you type. 'Use my money' copies your cash on hand from the API key."],
     ["Buy buffer (min)", "Minutes you'll realistically spend shopping after landing. Items predicted to sell out before you finish buying are skipped."],
+    ["Depart (local)", "When to fly for the route's headline item. LEAVE NOW means it is on the shelf when you land. A clock time means leave at that time to land right after a restock; those items carry a CATCH RESTOCK badge."],
     ["Active start / end", "Your awake window. Departure times and active-window recommendations target this period; 'Now' sets start to the current time."],
     ["Sleep (h)", "Hours you'll be asleep — the sleep plan times a departure so the best item is freshly restocked when you wake up."],
-    ["Stock on arrival", "Only recommend items that will actually be on the shelf when you land (respects depletion + restock timing)."],
+    ["Stock on arrival", "Only buy items that will still be on the shelf when you land. Untick to also count items predicted to sell out while you are in the air."],
     ["Stock window (min)", "Land ~N minutes AFTER a restock. Negative (default) = land as soon as possible after the restock. Restocks older than this window before landing are treated as already sold out."],
     ["Restock confidence", "Minimum trust level for restock predictions (live PromBot data / restock model). Lower = more speculative routes shown."],
     ["Nerve waste", "Tick the box if you care about nerve capping mid-flight. When on, warns if the round trip wastes more than N nerve and suggests how much to spend first."],
     ["Item tracker (tab)", "Track up to 10 specific items and get exact leave-times: for each destination stocking the item, when to depart so it's freshly restocked (per your stock window) at arrival, with expected shelf size and net per unit."],
-    ["API key", "Optional Torn API key (items + nerve). Needed for the nerve-waste estimate; stored locally in your browser only."],
+    ["API key", "Your Torn API key. Reads market values, your nerve bar and your cash on hand. Money needs at least Limited access; market values and nerve work on a minimal key. Stored locally in your browser only."],
     ["Auto-refresh", "Re-fetch live prices and restock data every 10 minutes."],
   ];
   const HELP_FLOW = [
@@ -2104,7 +2369,7 @@
     ["Pick a route from the table", "The highlighted row is the best route right now. Every row shows round-trip time, profit, profit-per-hour and departure times so you know exactly when to leave."],
     ["Read the stock badges", "IN STOCK = on the shelf when you land. RESTOCKS = item refills near your arrival (timing shown). EMPTY / GONE = don't bother — it won't be there."],
     ["Optional: sleep plan", "Enter your sleep hours and the planner times a departure so the best item is freshly restocked exactly when you wake up."],
-    ["Optional: nerve + API key", "Tick Nerve waste and add an API key to get a warning when a round trip would waste nerve, plus how much to spend before flying."],
+    ["Optional: nerve, cash and API key", "Tick Nerve waste and add an API key to get a warning when a round trip would waste nerve, plus how much to spend before flying. The same key shows your cash on hand, which one button copies into Budget."],
     ["Optional: item tracker", "Switch to the Item tracker tab, search for items you're hunting, and it tells you exactly when to leave for each destination so they're freshly restocked when you land."],
   ];
   function showHelp() {
@@ -2310,6 +2575,33 @@
       state.budget = v;
       onSettingsChange();
     }, "110px");
+    // Cash on hand from the API key, next to the budget it can fill. Copying it in
+    // is a button, never automatic: the budget is a spending decision, so it should
+    // only change when the user says so.
+    const cashRow = document.createElement("div");
+    cashRow.style.cssText = "display:flex;align-items:center;gap:6px;margin-top:4px;flex-wrap:wrap;";
+    cashTxtEl = document.createElement("span");
+    cashTxtEl.className = "ttp-cash";
+    cashBtnEl = document.createElement("button");
+    cashBtnEl.type = "button";
+    cashBtnEl.className = "ttp-btn";
+    cashBtnEl.textContent = "Use my money";
+    cashBtnEl.addEventListener("click", () => {
+      const c = lastData ? lastData.cash : null;
+      if (!c || c.state !== "ok") return;
+      state.budget = c.amount;
+      budInp.value = c.amount.toLocaleString("en-US");
+      if (budInp.__setErr) budInp.__setErr(null);
+      saveState();
+      onSettingsChange();
+      updateCash();
+    });
+    cashRow.appendChild(cashTxtEl);
+    cashRow.appendChild(cashBtnEl);
+    const budWrap = document.createElement("div");
+    budWrap.style.cssText = "display:flex;flex-direction:column;";
+    budWrap.appendChild(budInp);
+    budWrap.appendChild(cashRow);
     const bufInp = numInput(
       state.bufferMin,
       0,
@@ -2422,7 +2714,9 @@
     }
     const keyInp = document.createElement("input");
     keyInp.type = "password";
-    keyInp.placeholder = "API key (items + nerve)";
+    keyInp.placeholder = "Paste your key";
+    keyInp.title =
+      "Torn API key: reads market values, your nerve bar and your cash on hand (money needs Limited access)";
     keyInp.value = state.apiKey || "";
     keyInp.className = "ttp-input";
     keyInp.style.width = "120px";
@@ -2464,7 +2758,7 @@
     ctl.appendChild(field("Travel method", modeSel));
     ctl.appendChild(field("Item capacity", capInp));
     ctl.appendChild(field("Net % (trade)", netInp));
-    ctl.appendChild(field("Budget (capital)", budInp));
+    ctl.appendChild(field("Budget (capital)", budWrap));
     ctl.appendChild(field("Buy buffer (min)", bufInp));
     ctl.appendChild(field("Active start", startWrap));
     ctl.appendChild(field("Active end", endInp));
@@ -2560,6 +2854,7 @@
     body.appendChild(trackerWrap);
 
     setTab(state.tab === "tracker" ? "tracker" : "planner");
+    updateCash(); // cash-on-hand readout starts in its "reading" state
 
     container.appendChild(body);
     document.body.appendChild(container);
@@ -2653,6 +2948,11 @@
       "#ttp-root .ttp-input.ttp-bad,#ttp-root .ttp-sel.ttp-bad{border-color:#f85149;background:rgba(248,81,73,.07);} " +
       "#ttp-root .ttp-input:disabled{opacity:.45;} " +
       "#ttp-root .ttp-cb{width:14px;height:14px;accent-color:#238636;cursor:pointer;} " +
+      "#ttp-root .ttp-cash{color:#9aa4b2;font-size:10px;} " +
+      "#ttp-root .ttp-btn{background:#21262d;color:#e6edf3;border:1px solid #6e7681;border-radius:4px;padding:2px 7px;font-size:10px;cursor:pointer;} " +
+      "#ttp-root .ttp-btn:hover:not(:disabled){border-color:#58a6ff;color:#fff;} " +
+      "#ttp-root .ttp-btn:focus-visible{outline:2px solid #58a6ff;outline-offset:1px;} " +
+      "#ttp-root .ttp-btn:disabled{opacity:.45;cursor:default;} " +
       "#ttp-help{position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;font-family:Arial,sans-serif;}" +
       "#ttp-help .ttp-help-card{background:#161b22;border:1px solid #30363d;border-radius:10px;max-width:640px;width:92vw;max-height:80vh;overflow-y:auto;padding:16px 20px;box-shadow:0 8px 30px rgba(0,0,0,.8);color:#e6edf3;font-size:12px;}" +
       "#ttp-help h3{margin:0 0 12px;color:#58a6ff;font-size:14px;}" +
@@ -2713,6 +3013,11 @@
     loadData();
     scheduleAutoRefresh();
     scheduleStatusTicker();
+    // Flush any pending restock records before the tab goes away.
+    window.addEventListener("pagehide", flushHistory);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) flushHistory();
+    });
     log("Travel Planner ready.");
   }
 
@@ -2757,6 +3062,22 @@
       restockSource,
       departurePlan,
       localHHMM,
+      parseMoney,
+      groupDigits,
+      formatMoneyTyping,
+      normalizeBars,
+      moneyOnHand,
+      buildSummary,
+      updateCash,
+      flushHistory,
+      // Test-only plumbing: lets the harness capture buildSummary's HTML and drive
+      // the panel's cash-on-hand button headlessly.
+      __setSummaryEl(el) {
+        summaryEl = el;
+      },
+      __setLastData(v) {
+        lastData = v;
+      },
       setBackend(v) {
         _backend = v;
       },
