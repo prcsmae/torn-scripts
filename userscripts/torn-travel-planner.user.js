@@ -22,7 +22,7 @@
 
   // ========== CONFIG ==========
   const CONFIG = {
-    apiKey: "A0SxQ5FFORk9CNAs", // Minimal access is enough (items only)
+    apiKey: "", // Minimal access is enough (items only)
     yataUrl: "https://yata.yt/api/v1/travel/export/", // public, no auth (no restock field)
     prombotUrl: "https://api.prombot.co.uk/api/travel", // public; provides nextRestock (ISO)
     modelUrl:
