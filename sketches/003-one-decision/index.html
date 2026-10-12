@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Torn Travel Planner · Variant C · One decision</title>
+<style>
+  /* Design read: the same panel for the moment that matters, the ten seconds before
+     you tap Travel on a phone. One answer, big; everything else folded away.
+     Dial: ENERGY 1 / RHYTHM 1 / MOTION 1.
+     Colour: neutrals + ONE accent used only on the action and money up. */
+  :root{
+    --bg:#11151b; --raise:#191f27; --line:#2b333e; --line-soft:#232a34;
+    --ink:#f1f4f8; --ink-2:#a6b0bd; --ink-3:#7b8794;
+    --accent:#54c97a; --neg:#ef5b62; --amber:#d9a63f;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#090c10;color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.5;padding:24px 16px 48px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:620px;margin:0 auto}
+  .caption{color:var(--ink-3);font-size:11px;margin:0 0 12px 2px}
+  .caption b{color:var(--ink-2)}
+  .panel{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:18px 18px 14px}
+  .top{display:flex;align-items:center;gap:10px;color:var(--ink-3);font-size:12px;margin-bottom:18px}
+  .top .gear{margin-left:auto;background:none;border:1px solid var(--line);border-radius:6px;width:28px;height:28px;color:var(--ink-2);cursor:pointer;font-size:14px}
+  .top .gear:hover{color:var(--ink);border-color:var(--ink-3)}
+  .top .gear:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .fresh{display:inline-flex;align-items:center;gap:6px}
+  .fresh i{width:6px;height:6px;border-radius:50%;background:var(--accent);display:block}
+
+  .ask{color:var(--ink-3);font-size:12px;letter-spacing:.4px;text-transform:uppercase}
+  .where{font-size:30px;font-weight:650;letter-spacing:-.3px;margin:6px 0 0}
+  .where small{display:block;font-size:13px;font-weight:400;color:var(--ink-3);letter-spacing:0;margin-top:2px}
+
+  .when{margin:22px 0 0;padding:18px 0 4px;border-top:1px solid var(--line-soft);display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  .when .big{font-family:var(--mono);font-size:44px;font-weight:600;letter-spacing:-1px;line-height:1}
+  .when .rel{color:var(--accent);font-size:15px;font-weight:600}
+  .when .rel.soon{color:var(--amber)}
+
+  .buy{margin-top:20px;background:var(--raise);border:1px solid var(--line);border-radius:10px;padding:14px 15px}
+  .buy h2{font-size:12px;color:var(--ink-3);font-weight:600;text-transform:uppercase;letter-spacing:.4px;margin-bottom:10px}
+  .buy ul{list-style:none}
+  .buy li{display:flex;align-items:center;gap:11px;padding:7px 0;border-bottom:1px solid var(--line-soft);cursor:pointer}
+  .buy li:last-child{border-bottom:0}
+  .buy .box{width:17px;height:17px;border:1.5px solid var(--ink-3);border-radius:4px;flex:0 0 auto;display:grid;place-items:center;color:var(--accent-ink);font-size:12px}
+  .buy li.done .box{background:var(--accent);border-color:var(--accent);color:#0c1014}
+  .buy li.done .what{color:var(--ink-3);text-decoration:line-through}
+  .buy .what{flex:1}
+  .buy .qty{font-family:var(--mono);color:var(--ink-2)}
+  .buy .cash{font-family:var(--mono);color:var(--accent);white-space:nowrap}
+  .buy li.done .cash{color:var(--ink-3)}
+  .buy .total{display:flex;gap:16px;flex-wrap:wrap;margin-top:11px;padding-top:11px;border-top:1px solid var(--line);font-size:13px;color:var(--ink-2)}
+  .buy .total b{color:var(--ink)}
+  .buy .total .pos b{color:var(--accent)}
+
+  .alt{margin-top:16px;font-size:13px;color:var(--ink-2)}
+  .alt .row{display:flex;gap:12px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--line-soft)}
+  .alt .row:last-child{border-bottom:0}
+  .alt .n{flex:1}
+  .alt .h{font-family:var(--mono);color:var(--ink-2)}
+  .alt .w{font-family:var(--mono);color:var(--ink-3)}
+  details.all{margin-top:14px}
+  details.all>summary{cursor:pointer;color:var(--ink-3);font-size:12px;list-style:none;padding:6px 0}
+  details.all>summary::-webkit-details-marker{display:none}
+  details.all>summary::before{content:"▸ "}
+  details.all[open]>summary::before{content:"▾ "}
+  .all .row{display:flex;gap:12px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--line-soft);font-size:13px;color:var(--ink-2)}
+  .all .n{flex:1} .all .h{font-family:var(--mono)} .all .w{font-family:var(--mono);color:var(--ink-3)}
+
+  .settings{display:none;margin-top:16px;background:var(--raise);border:1px solid var(--line);border-radius:10px;padding:14px 15px}
+  .settings.open{display:block}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 12px}
+  @media (max-width:460px){ .grid{grid-template-columns:1fr} .where{font-size:25px} .when .big{font-size:36px} }
+  .fld label{display:block;font-size:11px;color:var(--ink-3);margin-bottom:4px}
+  .fld input,.fld select{width:100%;background:#0b0f14;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:6px 9px;font-size:13px}
+  .fld input:focus,.fld select:focus{outline:none;border-color:var(--accent)}
+  .sub{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}
+  .sub span{color:var(--ink-3);font-size:10px}
+  button.ghost{background:var(--raise);border:1px solid var(--line);color:var(--ink);border-radius:6px;font:inherit;font-size:12px;padding:5px 11px;cursor:pointer}
+  button.ghost:hover{border-color:var(--accent)}
+  button.ghost:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .note{margin-top:12px;color:var(--ink-3);font-size:11px;text-align:center}
+  .buy li:focus-visible,button.ghost:focus-visible,.top .gear:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  /* Touch: Torn is played on PDA, so controls and checklist rows clear the 44px target. */
+  @media (max-width:640px), (pointer:coarse){
+    .top .gear{width:44px;height:44px;font-size:16px}
+    button.ghost,.fld input,.fld select{min-height:44px}
+    .buy li{padding:12px 0}
+    .alt .row{padding:11px 0}
+    details.all>summary{min-height:44px;padding:13px 0}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="caption">Variant C · <b>One decision</b> · the pre-flight screen: where, when, what to buy. Real planner snapshot.</p>
+  <div class="panel">
+    <div class="top">
+      <span class="fresh"><i></i> feed 3s old</span>
+      <span>Airstrip · 18 slots · net 97%</span>
+      <button class="gear" id="gear" title="Settings" aria-expanded="false">⚙</button>
+    </div>
+
+    <div class="ask">Fly to</div>
+    <h1 class="where">Argentina<small>Buenos Aires · round trip 3h 47m</small></h1>
+
+    <div class="when">
+      <span class="big" id="clock">02:20</span>
+      <span class="rel" id="rel">in 3h 24m 07s</span>
+    </div>
+
+    <div class="buy">
+      <h2>Buy before you fly</h2>
+      <ul id="buylist">
+        <li data-cost="832834"><span class="box"></span><span class="what">Patagonian Fossil</span><span class="qty">×18</span><span class="cash">$9,864,000</span></li>
+      </ul>
+      <div class="total">
+        <span>Capital <b>$9,864,000</b></span>
+        <span>Slots <b>18 / 18</b></span>
+        <span class="pos">Profit <b>+$832,834</b></span>
+      </div>
+      <div class="note" style="text-align:left;margin-top:9px">Lands right after the restock (cloud data, high confidence). No waiting on the ground.</div>
+    </div>
+
+    <div class="alt">
+      <div class="row"><span class="n">United Kingdom <span style="color:var(--ink-3)">Xanax ×18</span></span><span class="h">leave 02:17</span><span class="w">$742,463</span><span class="h">$205,289/h</span></div>
+      <div class="row"><span class="n">Japan <span style="color:var(--ink-3)">Hydrochloric Acid ×18</span></span><span class="h">leave 12:10</span><span class="w">$1,026,700</span><span class="h">$203,307/h</span></div>
+    </div>
+
+    <details class="all">
+      <summary>All 11 routes</summary>
+      <div class="row"><span class="n">South Africa</span><span class="h">leave now</span><span class="w">$1,030,463</span></div>
+      <div class="row"><span class="n">United Arab Emirates</span><span class="h">leave 00:00</span><span class="w">$931,307</span></div>
+      <div class="row"><span class="n">China</span><span class="h">leave now</span><span class="w">$702,276</span></div>
+      <div class="row"><span class="n">Canada</span><span class="h">leave 00:08</span><span class="w">$115,644</span></div>
+      <div class="row"><span class="n">Cayman Islands</span><span class="h">leave now</span><span class="w">$78,359</span></div>
+      <div class="row"><span class="n">Mexico</span><span class="h">leave 23:07</span><span class="w">$47,713</span></div>
+      <div class="row"><span class="n">Switzerland</span><span class="h">leave 00:39</span><span class="w">$270,081</span></div>
+      <div class="row"><span class="n">Hawaii</span><span class="h">leave 23:00</span><span class="w">$112,499</span></div>
+    </details>
+
+    <div class="settings" id="settings">
+      <div class="grid">
+        <div class="fld"><label for="mode">Travel method</label>
+          <select id="mode"><option>Airstrip</option><option>Standard</option><option>WLT</option><option>Business</option></select></div>
+        <div class="fld"><label for="cap">Item capacity</label><input id="cap" value="18"></div>
+        <div class="fld"><label for="net">Net % (trade)</label><input id="net" value="97"></div>
+        <div class="fld"><label for="bud">Budget (capital)</label><input id="bud" value="50,000,000">
+          <div class="sub"><span>cash on hand [from your key]</span><button class="ghost" id="usecash">Use my money</button></div></div>
+        <div class="fld"><label for="start">Active start</label><input id="start" value="22:56"></div>
+        <div class="fld"><label for="end">Active end</label><input id="end" placeholder="off"></div>
+        <div class="fld"><label for="sleep">Sleep (h)</label><input id="sleep" value="8"></div>
+        <div class="fld"><label for="win">Stock window (min)</label><input id="win" value="-1"></div>
+        <div class="fld"><label for="conf">Restock confidence</label>
+          <select id="conf"><option>Med</option><option>High</option><option>Low</option></select></div>
+        <div class="fld"><label for="api">API key</label><input id="api" type="password" placeholder="Paste your key"></div>
+      </div>
+      <div class="sub" style="margin-top:12px">
+        <button class="ghost" id="refresh">Refresh</button>
+        <button class="ghost" id="tracker">Item tracker</button>
+        <span>Item tracker: leave times for up to 10 items.</span>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+// ticking countdown: the whole screen is about one moment, so it counts down
+let secs = 3 * 3600 + 24 * 60 + 7;
+const rel = document.getElementById("rel");
+setInterval(() => {
+  secs = Math.max(0, secs - 1);
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  rel.textContent = secs ? "in " + h + "h " + m + "m " + String(s).padStart(2, "0") + "s" : "leave now";
+  rel.classList.toggle("soon", secs > 0 && secs < 600);
+}, 1000);
+
+// tick items off as you buy them: a pre-flight list you actually work through
+document.querySelectorAll("#buylist li").forEach((li) => {
+  const toggleItem = () => {
+    li.classList.toggle("done");
+    const done = li.classList.contains("done");
+    li.querySelector(".box").textContent = done ? "✓" : "";
+    li.setAttribute("aria-checked", done ? "true" : "false");
+  };
+  li.tabIndex = 0;
+  li.setAttribute("role", "checkbox");
+  li.setAttribute("aria-checked", "false");
+  li.addEventListener("click", toggleItem);
+  li.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggleItem(); }
+  });
+});
+const gear = document.getElementById("gear"), settings = document.getElementById("settings");
+gear.addEventListener("click", () => {
+  settings.classList.toggle("open");
+  gear.setAttribute("aria-expanded", settings.classList.contains("open"));
+});
+document.getElementById("usecash").addEventListener("click", (e) => {
+  document.getElementById("bud").value = "12,345,678";
+  e.target.textContent = "Copied";
+  e.target.disabled = true;
+});
+</script>
+</body>
+</html>
